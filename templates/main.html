@@ -565,11 +565,51 @@
             const modal = document.getElementById('themeModal');
             modal.classList.add('show');
             updateThemeSelection(document.documentElement.getAttribute('data-theme'));
+            trapModalFocus(modal);
         }
 
         function closeThemeModal() {
             const modal = document.getElementById('themeModal');
             modal.classList.remove('show');
+            releaseModalFocus(modal);
+        }
+
+        // Focus the first tabbable element inside the modal and trap Tab
+        // until the modal closes, so keyboard users can't tab back into
+        // the page underneath.
+        function trapModalFocus(modal) {
+            modal._previousFocus = document.activeElement;
+            const focusables = modal.querySelectorAll(
+                'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+            );
+            if (focusables.length === 0) {
+                return;
+            }
+            const first = focusables[0];
+            const last = focusables[focusables.length - 1];
+            first.focus();
+            modal._trapHandler = (e) => {
+                if (e.key !== 'Tab') {
+                    return;
+                }
+                if (e.shiftKey && document.activeElement === first) {
+                    e.preventDefault();
+                    last.focus();
+                } else if (!e.shiftKey && document.activeElement === last) {
+                    e.preventDefault();
+                    first.focus();
+                }
+            };
+            modal.addEventListener('keydown', modal._trapHandler);
+        }
+
+        function releaseModalFocus(modal) {
+            if (modal._trapHandler) {
+                modal.removeEventListener('keydown', modal._trapHandler);
+                delete modal._trapHandler;
+            }
+            modal._previousFocus?.focus?.();
+            delete modal._previousFocus;
         }
 
         function selectTheme(theme) {
@@ -734,6 +774,7 @@
             container.replaceChildren(clone);
 
             modal.classList.add('show');
+            trapModalFocus(modal);
 
             // Defer panzoom init until after layout: bounds:true samples the
             // bounding rect at construction, and the clone was just inserted.
@@ -757,6 +798,7 @@
             delete modal._panzoomInstance;
             document.getElementById('diagramModalContent').replaceChildren();
             modal.classList.remove('show');
+            releaseModalFocus(modal);
         }
 
         // Auto-refresh functionality using WebSocket
@@ -858,7 +900,7 @@
 {{ content }}
 </div>
 
-<div class="diagram-modal" id="diagramModal" role="dialog" aria-label="Expanded diagram">
+<div class="diagram-modal" id="diagramModal" role="dialog" aria-modal="true" aria-label="Expanded diagram">
     <button type="button" class="diagram-modal-close" id="diagramModalClose" aria-label="Close diagram">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -868,7 +910,7 @@
     <div class="diagram-modal-content" id="diagramModalContent"></div>
 </div>
 
-<div class="theme-modal" id="themeModal">
+<div class="theme-modal" id="themeModal" role="dialog" aria-modal="true" aria-label="Choose theme">
     <div class="theme-modal-content">
         <h3>Choose Theme</h3>
         <div class="theme-grid">
