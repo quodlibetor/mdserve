@@ -25,6 +25,11 @@ struct Args {
     /// Open the preview in the default browser
     #[arg(short, long)]
     open: bool,
+
+    /// Inline mermaid and panzoom JS into the HTML so saved pages render
+    /// diagrams without the server
+    #[arg(long)]
+    standalone: bool,
 }
 
 #[tokio::main]
@@ -59,6 +64,7 @@ async fn main() -> Result<()> {
         args.hostname,
         args.port,
         args.open,
+        args.standalone,
     )
     .await?;
 
