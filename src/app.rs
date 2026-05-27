@@ -85,11 +85,17 @@ struct MarkdownState {
     base_dir: PathBuf,
     tracked_files: HashMap<String, TrackedFile>,
     is_directory_mode: bool,
+    standalone: bool,
     change_tx: broadcast::Sender<ServerMessage>,
 }
 
 impl MarkdownState {
-    fn new(base_dir: PathBuf, file_paths: Vec<PathBuf>, is_directory_mode: bool) -> Result<Self> {
+    fn new(
+        base_dir: PathBuf,
+        file_paths: Vec<PathBuf>,
+        is_directory_mode: bool,
+        standalone: bool,
+    ) -> Result<Self> {
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
 
         let mut tracked_files = HashMap::new();
@@ -115,6 +121,7 @@ impl MarkdownState {
             base_dir,
             tracked_files,
             is_directory_mode,
+            standalone,
             change_tx,
         })
     }
@@ -268,6 +275,7 @@ fn new_router(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
     is_directory_mode: bool,
+    standalone: bool,
 ) -> Result<Router> {
     let base_dir = base_dir.canonicalize()?;
 
@@ -275,6 +283,7 @@ fn new_router(
         base_dir.clone(),
         tracked_files,
         is_directory_mode,
+        standalone,
     )?));
 
     let watcher_state = state.clone();
@@ -340,11 +349,12 @@ pub(crate) async fn serve_markdown(
     hostname: impl AsRef<str>,
     port: u16,
     open: bool,
+    standalone: bool,
 ) -> Result<()> {
     let hostname = hostname.as_ref();
 
     let first_file = tracked_files.first().cloned();
-    let router = new_router(base_dir.clone(), tracked_files, is_directory_mode)?;
+    let router = new_router(base_dir.clone(), tracked_files, is_directory_mode, standalone)?;
 
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
 
@@ -499,6 +509,15 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
         .and_then(|s| s.to_str())
         .unwrap_or(current_file);
 
+    let (mermaid_js, panzoom_js) = if state.standalone && has_mermaid {
+        (
+            Value::from_safe_string(MERMAID_JS.to_string()),
+            Value::from_safe_string(PANZOOM_JS.to_string()),
+        )
+    } else {
+        (Value::from(""), Value::from(""))
+    };
+
     let rendered = if state.show_navigation() {
         let filenames = state.get_sorted_filenames();
         let files: Vec<Value> = filenames
@@ -519,6 +538,9 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             files => files,
             current_file => current_file,
             page_title => page_title,
+            standalone => state.standalone,
+            mermaid_js => mermaid_js,
+            panzoom_js => panzoom_js,
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -534,6 +556,9 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             mermaid_enabled => has_mermaid,
             show_navigation => false,
             page_title => page_title,
+            standalone => state.standalone,
+            mermaid_js => mermaid_js,
+            panzoom_js => panzoom_js,
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -908,7 +933,7 @@ mod tests {
         let tracked_files = vec![canonical_path];
         let is_directory_mode = false;
 
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
+        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
             .expect("Failed to create router");
 
         let server = if use_http {
@@ -945,7 +970,7 @@ mod tests {
         let tracked_files = scan_markdown_files(&base_dir).expect("Failed to scan markdown files");
         let is_directory_mode = true;
 
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
+        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
             .expect("Failed to create router");
 
         let server = if use_http {
@@ -1080,7 +1105,7 @@ fn main() {
         let base_dir = temp_dir.path().to_path_buf();
         let tracked_files = vec![md_path];
         let is_directory_mode = false;
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
+        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
             .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
@@ -1109,7 +1134,7 @@ fn main() {
         let base_dir = temp_dir.path().to_path_buf();
         let tracked_files = vec![md_path];
         let is_directory_mode = false;
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
+        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
             .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
@@ -1338,6 +1363,78 @@ classDiagram
 
         assert_eq!(response_200.status_code(), 200);
         assert!(!response_200.as_bytes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_standalone_inlines_mermaid_and_panzoom_js() {
+        let content = "# Standalone\n\n```mermaid\ngraph LR\n  A --> B\n```\n";
+
+        let temp_file = Builder::new().suffix(".md").tempfile().unwrap();
+        fs::write(&temp_file, content).unwrap();
+        let canonical_path = temp_file
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp_file.path().to_path_buf());
+        let base_dir = canonical_path.parent().unwrap().to_path_buf();
+        let router = new_router(base_dir, vec![canonical_path], false, true).unwrap();
+        let server = TestServer::new(router).unwrap();
+
+        let body = server.get("/").await.text();
+
+        assert!(
+            !body.contains(r#"<script src="/mermaid.min.js"></script>"#),
+            "standalone mode should not emit external mermaid script tag"
+        );
+        assert!(
+            !body.contains(r#"<script src="/panzoom.min.js"></script>"#),
+            "standalone mode should not emit external panzoom script tag"
+        );
+        assert!(
+            body.contains(MERMAID_JS),
+            "mermaid.min.js content should be inlined in the HTML body"
+        );
+        assert!(
+            body.contains(PANZOOM_JS),
+            "panzoom.min.js content should be inlined in the HTML body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_reload_skips_non_http_protocols() {
+        let (server, _temp_file) = create_test_server("# Test").await;
+        let body = server.get("/").await.text();
+        // The page must guard against opening a WebSocket when loaded from
+        // a saved file (file:// or other non-http schemes).
+        assert!(
+            body.contains("window.location.protocol !== 'http:'"),
+            "live reload must check the page protocol before connecting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_standalone_no_inlining_without_mermaid() {
+        let content = "# No diagrams here\n\nJust plain text.\n";
+
+        let temp_file = Builder::new().suffix(".md").tempfile().unwrap();
+        fs::write(&temp_file, content).unwrap();
+        let canonical_path = temp_file
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp_file.path().to_path_buf());
+        let base_dir = canonical_path.parent().unwrap().to_path_buf();
+        let router = new_router(base_dir, vec![canonical_path], false, true).unwrap();
+        let server = TestServer::new(router).unwrap();
+
+        let body = server.get("/").await.text();
+
+        assert!(
+            !body.contains(MERMAID_JS),
+            "mermaid.min.js should not be inlined when page has no mermaid blocks"
+        );
+        assert!(
+            !body.contains(PANZOOM_JS),
+            "panzoom.min.js should not be inlined when page has no mermaid blocks"
+        );
     }
 
     #[tokio::test]

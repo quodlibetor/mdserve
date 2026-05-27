@@ -547,8 +547,13 @@
     </style>
 
     {% if mermaid_enabled %}
+    {% if standalone %}
+    <script>{{ mermaid_js }}</script>
+    <script>{{ panzoom_js }}</script>
+    {% else %}
     <script src="/mermaid.min.js"></script>
     <script src="/panzoom.min.js"></script>
+    {% endif %}
     {% endif %}
     <script>
         let lastModified = Date.now();
@@ -801,8 +806,12 @@
             releaseModalFocus(modal);
         }
 
-        // Auto-refresh functionality using WebSocket
+        // Auto-refresh functionality using WebSocket.
+        // Skip on file:// — the page was saved and there is no server to reach.
         function setupLiveReload() {
+            if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
+                return;
+            }
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
             const socket = new WebSocket(wsUrl);
