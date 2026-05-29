@@ -22,6 +22,10 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
+use syntect::highlighting::ThemeSet;
+use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, Mutex},
@@ -342,7 +346,179 @@ fn markdown_to_html_inner(content: &str, allow_dangerous_protocol: bool) -> Resu
         .unwrap_or_else(|_| "Error parsing markdown".to_string());
 
     let html_body = render_github_alerts(&html_body);
-    Ok(add_heading_ids(&html_body))
+    let html_body = add_heading_ids(&html_body);
+    Ok(highlight_code_blocks(&html_body))
+}
+
+/// CSS class prefix for syntax-highlight spans. Namespaces the generated rules
+/// (so they can't collide with content classes) and lets the renderer detect
+/// whether a page contains highlighted code.
+const SYN_PREFIX: &str = "syn-";
+
+fn syntect_class_style() -> ClassStyle {
+    ClassStyle::SpacedPrefixed { prefix: SYN_PREFIX }
+}
+
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
+    // two-face bundles bat's syntax set (~250 languages incl. TypeScript, TOML,
+    // Dockerfile, Kotlin, Swift, ...). The `newlines` variant matches our
+    // line-by-line highlighter.
+    SYNTAXES.get_or_init(two_face::syntax::extra_newlines)
+}
+
+/// CSS for syntax highlighting, scoped per page theme so colors follow the
+/// theme toggle. Built once. A light theme covers the light page themes and a
+/// dark theme covers the dark ones.
+pub(crate) fn highlight_css() -> &'static str {
+    static CSS: OnceLock<String> = OnceLock::new();
+    CSS.get_or_init(|| {
+        let themes = ThemeSet::load_defaults();
+        let style = syntect_class_style();
+        let light = themes
+            .themes
+            .get("InspiredGitHub")
+            .and_then(|t| css_for_theme_with_class_style(t, style).ok())
+            .unwrap_or_default();
+        let dark = themes
+            .themes
+            .get("base16-ocean.dark")
+            .and_then(|t| css_for_theme_with_class_style(t, style).ok())
+            .unwrap_or_default();
+
+        let mut css = String::new();
+        for theme in ["light", "catppuccin-latte"] {
+            css.push_str(&scope_css(&light, &format!("html[data-theme=\"{theme}\"]")));
+        }
+        for theme in ["dark", "catppuccin-mocha", "catppuccin-macchiato"] {
+            css.push_str(&scope_css(&dark, &format!("html[data-theme=\"{theme}\"]")));
+        }
+        css
+    })
+    .as_str()
+}
+
+/// Whether a rendered body contains highlighted code (so the page only carries
+/// the highlight CSS when it's actually used).
+pub(crate) fn has_highlighting(html: &str) -> bool {
+    html.contains(SYN_PREFIX)
+}
+
+/// Prefixes every selector in a syntect-generated stylesheet with `scope` so its
+/// rules only apply under that page theme. Drops the `.syn-code` base rule
+/// (background/foreground) so the page's own code styling is kept, and strips
+/// the comment header.
+fn scope_css(css: &str, scope: &str) -> String {
+    let base = format!(".{SYN_PREFIX}code");
+    let mut out = String::with_capacity(css.len());
+    let mut s = css;
+    while let Some(open) = s.find('{') {
+        let selectors_raw = strip_block_comments(&s[..open]);
+        let after = &s[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        let body = &after[..close];
+        s = &after[close + 1..];
+
+        let selectors: Vec<String> = selectors_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|sel| !sel.is_empty() && *sel != base)
+            .map(|sel| format!("{scope} {sel}"))
+            .collect();
+        if selectors.is_empty() {
+            continue;
+        }
+        out.push_str(&selectors.join(", "));
+        out.push_str(" {");
+        out.push_str(body);
+        out.push_str("}\n");
+    }
+    out
+}
+
+fn strip_block_comments(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Highlights fenced code blocks (`<pre><code class="language-LANG">`) in place
+/// using syntect, leaving `language-mermaid` blocks and unknown languages
+/// untouched.
+fn highlight_code_blocks(html: &str) -> String {
+    let marker = "<pre><code class=\"language-";
+    let closing = "</code></pre>";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+
+    while let Some(pos) = rest.find(marker) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + marker.len()..];
+        let Some(qend) = after.find('"') else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let lang = &after[..qend];
+        let code_start = match after[qend..].find('>') {
+            Some(gt) => pos + marker.len() + qend + gt + 1,
+            None => {
+                out.push_str(&rest[pos..]);
+                return out;
+            }
+        };
+        let Some(crel) = rest[code_start..].find(closing) else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let code_html = &rest[code_start..code_start + crel];
+        let block_end = code_start + crel + closing.len();
+
+        match (lang != "mermaid")
+            .then(|| highlight_one(lang, code_html))
+            .flatten()
+        {
+            Some(spans) => {
+                out.push_str(&format!("<pre><code class=\"language-{lang}\">"));
+                out.push_str(&spans);
+                out.push_str(closing);
+            }
+            // Mermaid, unknown language, or highlight failure: keep verbatim.
+            None => out.push_str(&rest[pos..block_end]),
+        }
+        rest = &rest[block_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn highlight_one(lang: &str, code_html: &str) -> Option<String> {
+    let syntaxes = syntax_set();
+    let syntax = syntaxes.find_syntax_by_token(lang)?;
+    let source = decode_code_entities(code_html);
+    let mut generator =
+        ClassedHTMLGenerator::new_with_class_style(syntax, syntaxes, syntect_class_style());
+    for line in LinesWithEndings::from(&source) {
+        generator
+            .parse_html_for_line_which_includes_newline(line)
+            .ok()?;
+    }
+    Some(generator.finalize())
+}
+
+fn decode_code_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Alert kinds GitHub recognizes: `(marker, title, emoji)`.
@@ -436,7 +612,7 @@ fn alert_from_blockquote(inner: &str) -> Option<String> {
     ))
 }
 
-// Link (chain) octicon shown on heading hover, linking to the heading's anchor.
+/// Link (chain) octicon shown on heading hover, linking to the heading's anchor.
 const HEADING_ANCHOR_ICON: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 2 2 0 0 0 2.83 0l2.5-2.5a2 2 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a2 2 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 2 2 0 0 0-2.83 0l-2.5 2.5a2 2 0 0 0 0 2.83Z"></path></svg>"##;
 
 /// Adds GitHub-style slug `id` attributes to `<h1>`..`<h6>` tags so in-page
@@ -939,13 +1115,19 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
         }
     };
 
-    let (content, has_mermaid) = if let Some(tracked) = state.tracked_files.get(current_file) {
-        let html = &tracked.html;
-        let mermaid = html.contains(r#"class="language-mermaid""#);
-        (Value::from_safe_string(html.clone()), mermaid)
-    } else {
-        return (StatusCode::NOT_FOUND, Html("File not found".to_string()));
-    };
+    let (content, has_mermaid, highlight_css_value) =
+        if let Some(tracked) = state.tracked_files.get(current_file) {
+            let html = &tracked.html;
+            let mermaid = html.contains(r#"class="language-mermaid""#);
+            let css = if has_highlighting(html) {
+                Value::from_safe_string(highlight_css().to_string())
+            } else {
+                Value::from("")
+            };
+            (Value::from_safe_string(html.clone()), mermaid, css)
+        } else {
+            return (StatusCode::NOT_FOUND, Html("File not found".to_string()));
+        };
 
     // Derive page title from filename (stem without extension)
     let page_title = std::path::Path::new(current_file)
@@ -994,6 +1176,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             panzoom_js => panzoom_js,
             mermaid_js_src => Value::from_safe_string("/mermaid.min.js".to_string()),
             panzoom_js_src => Value::from_safe_string("/panzoom.min.js".to_string()),
+            highlight_css => highlight_css_value.clone(),
             // The download button is a live-server affordance: always shown here
             // (including under --standalone), never in the generated bundle pages.
             show_download => true,
@@ -1017,6 +1200,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             panzoom_js => panzoom_js,
             mermaid_js_src => Value::from_safe_string("/mermaid.min.js".to_string()),
             panzoom_js_src => Value::from_safe_string("/panzoom.min.js".to_string()),
+            highlight_css => highlight_css_value.clone(),
             // The download button is a live-server affordance: always shown here
             // (including under --standalone), never in the generated bundle pages.
             show_download => true,
@@ -1049,6 +1233,11 @@ pub(crate) fn render_bundle_page(html_body: &str, page_title: &str, asset_prefix
     };
 
     let has_mermaid = html_body.contains(r#"class="language-mermaid""#);
+    let highlight_css_value = if has_highlighting(html_body) {
+        Value::from_safe_string(highlight_css().to_string())
+    } else {
+        Value::from("")
+    };
 
     template
         .render(context! {
@@ -1066,6 +1255,7 @@ pub(crate) fn render_bundle_page(html_body: &str, page_title: &str, asset_prefix
             panzoom_js_src => Value::from_safe_string(
                 format!("{asset_prefix}{}", crate::bundle::BUNDLE_PANZOOM_JS_PATH)
             ),
+            highlight_css => highlight_css_value,
             // No download button inside the bundle's own pages.
             show_download => false,
         })
@@ -1458,6 +1648,41 @@ mod tests {
             html.contains(r##"<h1 id="intro"><a class="heading-anchor" href="#intro""##),
             "{html}"
         );
+    }
+
+    #[test]
+    fn test_code_blocks_are_highlighted() {
+        let html = markdown_to_html("```rust\nfn main() {}\n```\n").unwrap();
+        // Highlighted into namespaced spans, original language class kept.
+        assert!(
+            html.contains(r#"<pre><code class="language-rust">"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"<span class="syn-"#), "{html}");
+        assert!(has_highlighting(&html));
+        // Theme-scoped CSS exists for both light and dark page themes.
+        let css = highlight_css();
+        assert!(css.contains(r#"html[data-theme="dark"] .syn-"#), "{css}");
+        assert!(css.contains(r#"html[data-theme="light"] .syn-"#), "{css}");
+        // The background base rule is dropped (page keeps its own code bg).
+        assert!(!css.contains(".syn-code {"), "{css}");
+    }
+
+    #[test]
+    fn test_mermaid_and_unknown_langs_not_highlighted() {
+        let mermaid = markdown_to_html("```mermaid\ngraph TD\nA-->B\n```\n").unwrap();
+        assert!(
+            mermaid.contains(r#"language-mermaid">graph TD"#),
+            "{mermaid}"
+        );
+        assert!(!has_highlighting(&mermaid));
+
+        let unknown = markdown_to_html("```nosuchlang\nplain text\n```\n").unwrap();
+        assert!(
+            unknown.contains(r#"language-nosuchlang">plain text"#),
+            "{unknown}"
+        );
+        assert!(!has_highlighting(&unknown));
     }
 
     #[test]
@@ -2015,8 +2240,11 @@ fn main() {
         assert!(body.contains("<th>Name</th>"));
         assert!(body.contains("<td>John</td>"));
         assert!(body.contains("<del>deleted text</del>"));
-        assert!(body.contains("<pre>"));
-        assert!(body.contains("fn main()"));
+        // Code block is syntax-highlighted: language class kept, tokens wrapped
+        // in highlight spans (so "fn main()" is no longer one contiguous string).
+        assert!(body.contains(r#"<pre><code class="language-rust">"#));
+        assert!(body.contains(r#"<span class="syn-"#));
+        assert!(body.contains("main"));
     }
 
     #[tokio::test]

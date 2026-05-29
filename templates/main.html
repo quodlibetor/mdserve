@@ -595,6 +595,10 @@
         img { max-width: 100%; height: auto; }
     </style>
 
+    {% if highlight_css %}
+    <style>{{ highlight_css }}</style>
+    {% endif %}
+
     {% if mermaid_enabled %}
     {% if mermaid_js %}
     <script>{{ mermaid_js }}</script>

@@ -143,7 +143,7 @@ within the base directory.
 
 ### Rendering
 
-Markdown is rendered to HTML with [markdown-rs](https://github.com/wooorm/markdown-rs); rendered headings then get GitHub-style slug `id` attributes so in-page `#anchor` links resolve, both in the live preview and the offline bundle.
+Markdown is rendered to HTML with [markdown-rs](https://github.com/wooorm/markdown-rs), then post-processed in `src/app.rs`: rendered headings get GitHub-style slug `id` attributes plus a clickable hover anchor link (`add_heading_ids`) so in-page `#anchor` links resolve; GitHub alert blockquotes (`> [!NOTE]` etc.) become styled callouts (`render_github_alerts`); and fenced code blocks are syntax-highlighted server-side with [syntect](https://github.com/trishume/syntect) (`highlight_code_blocks`), using [two-face](https://github.com/CosmicHorrorDev/two-face)'s ~250-language syntax set (bat's), emitting `syn-`-prefixed class spans with theme-scoped CSS (`highlight_css`) so colors follow the page theme. All of this applies to both the live preview and the offline bundle (no client-side JS).
 
 The page is assembled with [MiniJinja](https://github.com/mitsuhiko/minijinja) (Jinja2 template syntax) with templates embedded at compile time via [minijinja_embed](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-embed).
 
