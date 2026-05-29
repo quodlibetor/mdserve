@@ -140,7 +140,12 @@ mdserve README.md --open
 - Scans and serves all `.md` and `.markdown` files in that directory
 - Displays a navigation sidebar for easy switching between files
 - Watches for new markdown files added to the directory
-- Only monitors the immediate directory (non-recursive)
+- Recurses into subdirectories by default, respecting `.gitignore` and skipping
+  hidden directories (use `--no-recursive` to scan only the immediate directory)
+- Scans in the background, so the server answers immediately and the sidebar
+  fills in as files are found — a large tree never delays the first page
+- Serves a directory you name explicitly even when a parent `.gitignore`
+  excludes it, so `mdserve tasks/emails` works in a repo that ignores `tasks/`
 
 
 ## Themes

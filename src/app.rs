@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use ignore::{gitignore::GitignoreBuilder, Match, WalkBuilder};
 use minijinja::{context, value::Value, Environment};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     net::TcpListener,
@@ -34,6 +35,10 @@ const PANZOOM_JS: &str = include_str!("../static/js/panzoom.min.js");
 const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "-mermaid\"");
 const PANZOOM_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "-panzoom\"");
 const MAX_PORT_ATTEMPTS: u16 = 10;
+/// Smallest gap between file-list updates pushed to the browser during the
+/// background scan. Fast enough to feel live, slow enough that indexing a tree
+/// with thousands of files doesn't flood the socket.
+const SCAN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 type SharedMarkdownState = Arc<Mutex<MarkdownState>>;
 
@@ -49,23 +54,147 @@ fn template_env() -> &'static Environment<'static> {
 #[serde(tag = "type")]
 enum ServerMessage {
     Reload,
+    /// The set of tracked files changed. Carries the whole sorted list so the
+    /// client can rebuild its sidebar in place; used by the background scan and
+    /// by files appearing later, neither of which changes the page being read.
+    Files {
+        files: Vec<String>,
+        scanning: bool,
+    },
 }
 
-pub(crate) fn scan_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut md_files = Vec::new();
+/// Walks `dir` yielding markdown files. When `recursive` is true, subdirectories
+/// are walked too; otherwise only the immediate directory is read. The walk
+/// respects `.gitignore`/`.ignore` rules and skips hidden files and directories
+/// (e.g. `.git`) via the `ignore` crate's defaults, except that ignore rules
+/// *above* `dir` are dropped when they would exclude `dir` itself — see
+/// [`ignored_by_ancestor`].
+fn markdown_walk(dir: &Path, recursive: bool) -> impl Iterator<Item = PathBuf> {
+    let mut builder = WalkBuilder::new(dir);
+    // Depth 0 is `dir` itself and depth 1 is its immediate children, so capping
+    // at 1 reproduces the non-recursive single-directory behavior.
+    builder.max_depth(if recursive { None } else { Some(1) });
+    // Naming a directory on the command line is an explicit request to serve it,
+    // which outranks a parent `.gitignore` that excludes it. Disabling parent
+    // ignore files leaves ignore files *inside* the tree in force, so
+    // `mdserve tasks/emails` still honors `tasks/emails/.gitignore`.
+    builder.parents(!ignored_by_ancestor(dir));
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    builder.build().filter_map(|entry| {
+        let entry = entry.ok()?;
         let path = entry.path();
+        (entry.file_type().is_some_and(|ft| ft.is_file()) && is_markdown_file(path))
+            .then(|| path.to_path_buf())
+    })
+}
 
-        if path.is_file() && is_markdown_file(&path) {
-            md_files.push(path);
+/// Whether an ignore file in a directory above `dir` excludes `dir`. Ancestors
+/// are consulted nearest-first (so a closer whitelist wins, as in git) and the
+/// search stops at the directory holding `.git`, since gitignore rules don't
+/// apply across a repository boundary.
+fn ignored_by_ancestor(dir: &Path) -> bool {
+    for ancestor in dir.ancestors().skip(1) {
+        let mut builder = GitignoreBuilder::new(ancestor);
+        for name in [".gitignore", ".ignore"] {
+            builder.add(ancestor.join(name));
+        }
+        if let Ok(gitignore) = builder.build() {
+            match gitignore.matched_path_or_any_parents(dir, true) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        if ancestor.join(".git").exists() {
+            break;
         }
     }
+    false
+}
 
+/// Collects the same walk as a sorted list. The server streams the walk instead
+/// (see [`spawn_background_scan`]), so this exists for tests that need the whole
+/// result up front.
+#[cfg(test)]
+fn scan_markdown_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    let mut md_files: Vec<PathBuf> = markdown_walk(dir, recursive).collect();
     md_files.sort();
-
     Ok(md_files)
+}
+
+/// Walks `dir` on a blocking thread, adding each markdown file to `state` as it
+/// is found and pushing the growing file list to connected clients at most once
+/// every [`SCAN_UPDATE_INTERVAL`]. Serving starts before the walk finishes, so a
+/// large tree is browsable while it is still being indexed.
+fn spawn_background_scan(state: SharedMarkdownState, dir: PathBuf, recursive: bool) {
+    tokio::task::spawn_blocking(move || {
+        let mut last_sent = Instant::now();
+        let mut unsent_files = false;
+
+        for path in markdown_walk(&dir, recursive) {
+            let mut state = state.blocking_lock();
+            // A file the watcher already picked up is skipped by key, so a
+            // change racing the scan isn't clobbered by the scan's older read.
+            unsent_files |= state.add_tracked_file(path).is_ok();
+            if unsent_files && last_sent.elapsed() >= SCAN_UPDATE_INTERVAL {
+                state.broadcast_file_list();
+                last_sent = Instant::now();
+                unsent_files = false;
+            }
+        }
+
+        let mut state = state.blocking_lock();
+        state.scanning = false;
+        if state.tracked_files.is_empty() {
+            eprintln!("⚠ No markdown files found in {}", dir.display());
+        }
+        // Always sent, even with nothing new, so the client learns the scan is
+        // over and stops showing it as in progress.
+        state.broadcast_file_list();
+    });
+}
+
+/// Computes the key used to track and address a file: its path relative to
+/// `base_dir`, with forward slashes regardless of platform. For files directly
+/// in `base_dir` this is just the filename, so single-file and non-recursive
+/// directory modes are unaffected.
+fn relative_key(base_dir: &Path, path: &Path) -> String {
+    let rel: PathBuf = match path.strip_prefix(base_dir) {
+        Ok(p) => p.to_path_buf(),
+        Err(_) => match path.canonicalize() {
+            Ok(canonical) => canonical
+                .strip_prefix(base_dir)
+                .map(|p| p.to_path_buf())
+                .unwrap_or(canonical),
+            Err(_) => path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf()),
+        },
+    };
+
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// HTML-escapes a string for use in an attribute value, but leaves `/`
+/// untouched so multi-segment paths read as `/a/b.md` rather than
+/// `/a&#x2f;b.md` while remaining safe against injection.
+fn html_escape_keep_slash(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -86,6 +215,9 @@ struct MarkdownState {
     tracked_files: HashMap<String, TrackedFile>,
     is_directory_mode: bool,
     standalone: bool,
+    /// Whether the initial directory scan is still running, so the UI can say
+    /// "scanning" instead of looking like an empty directory.
+    scanning: bool,
     change_tx: broadcast::Sender<ServerMessage>,
 }
 
@@ -95,6 +227,7 @@ impl MarkdownState {
         file_paths: Vec<PathBuf>,
         is_directory_mode: bool,
         standalone: bool,
+        scanning: bool,
     ) -> Result<Self> {
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
 
@@ -105,10 +238,10 @@ impl MarkdownState {
             let content = fs::read_to_string(&file_path)?;
             let html = Self::markdown_to_html(&content)?;
 
-            let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
+            let key = relative_key(&base_dir, &file_path);
 
             tracked_files.insert(
-                filename,
+                key,
                 TrackedFile {
                     path: file_path,
                     last_modified,
@@ -122,12 +255,22 @@ impl MarkdownState {
             tracked_files,
             is_directory_mode,
             standalone,
+            scanning,
             change_tx,
         })
     }
 
     fn show_navigation(&self) -> bool {
         self.is_directory_mode
+    }
+
+    /// Pushes the current file list to connected clients so they can refresh
+    /// their sidebar without reloading the page being read.
+    fn broadcast_file_list(&self) {
+        let _ = self.change_tx.send(ServerMessage::Files {
+            files: self.get_sorted_filenames(),
+            scanning: self.scanning,
+        });
     }
 
     fn get_sorted_filenames(&self) -> Vec<String> {
@@ -145,18 +288,19 @@ impl MarkdownState {
         Ok(())
     }
 
-    fn add_tracked_file(&mut self, file_path: PathBuf) -> Result<()> {
-        let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
+    /// Renders and starts tracking `file_path`, returning whether it was new.
+    fn add_tracked_file(&mut self, file_path: PathBuf) -> Result<bool> {
+        let key = relative_key(&self.base_dir, &file_path);
 
-        if self.tracked_files.contains_key(&filename) {
-            return Ok(());
+        if self.tracked_files.contains_key(&key) {
+            return Ok(false);
         }
 
         let metadata = fs::metadata(&file_path)?;
         let content = fs::read_to_string(&file_path)?;
 
         self.tracked_files.insert(
-            filename,
+            key,
             TrackedFile {
                 path: file_path,
                 last_modified: metadata.modified()?,
@@ -164,7 +308,7 @@ impl MarkdownState {
             },
         );
 
-        Ok(())
+        Ok(true)
     }
 
     fn markdown_to_html(content: &str) -> Result<String> {
@@ -186,22 +330,20 @@ async fn handle_markdown_file_change(path: &Path, state: &SharedMarkdownState) {
         return;
     }
 
-    let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
-    let Some(filename) = filename else {
-        return;
-    };
-
     let mut state_guard = state.lock().await;
 
+    let key = relative_key(&state_guard.base_dir, path);
+
     // If file is already tracked, refresh its content
-    if state_guard.tracked_files.contains_key(&filename) {
-        if state_guard.refresh_file(&filename).is_ok() {
+    if state_guard.tracked_files.contains_key(&key) {
+        if state_guard.refresh_file(&key).is_ok() {
             let _ = state_guard.change_tx.send(ServerMessage::Reload);
         }
     } else if state_guard.is_directory_mode {
-        // New file in directory mode - add and reload
-        if state_guard.add_tracked_file(path.to_path_buf()).is_ok() {
-            let _ = state_guard.change_tx.send(ServerMessage::Reload);
+        // New file in directory mode: nothing on the open page changed, so
+        // clients only need the updated file list for their sidebar.
+        if matches!(state_guard.add_tracked_file(path.to_path_buf()), Ok(true)) {
+            state_guard.broadcast_file_list();
         }
     }
 }
@@ -276,6 +418,8 @@ fn new_router(
     tracked_files: Vec<PathBuf>,
     is_directory_mode: bool,
     standalone: bool,
+    recursive: bool,
+    background_scan: bool,
 ) -> Result<Router> {
     let base_dir = base_dir.canonicalize()?;
 
@@ -284,7 +428,12 @@ fn new_router(
         tracked_files,
         is_directory_mode,
         standalone,
+        background_scan,
     )?));
+
+    if background_scan {
+        spawn_background_scan(state.clone(), base_dir.clone(), recursive);
+    }
 
     let watcher_state = state.clone();
     let (tx, mut rx) = mpsc::channel(100);
@@ -298,7 +447,12 @@ fn new_router(
         Config::default(),
     )?;
 
-    watcher.watch(&base_dir, RecursiveMode::NonRecursive)?;
+    let watch_mode = if recursive {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    };
+    watcher.watch(&base_dir, watch_mode)?;
 
     tokio::spawn(async move {
         let _watcher = watcher;
@@ -343,6 +497,7 @@ async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)
         )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_markdown(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
@@ -351,11 +506,21 @@ pub(crate) async fn serve_markdown(
     port: u16,
     open: bool,
     standalone: bool,
+    recursive: bool,
 ) -> Result<()> {
     let hostname = hostname.as_ref();
 
     let first_file = tracked_files.first().cloned();
-    let router = new_router(base_dir.clone(), tracked_files, is_directory_mode, standalone)?;
+    let router = new_router(
+        base_dir.clone(),
+        tracked_files,
+        is_directory_mode,
+        standalone,
+        recursive,
+        // Directory mode always discovers its files in the background so a large
+        // tree doesn't delay the first page; single-file mode has nothing to scan.
+        is_directory_mode,
+    )?;
 
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
 
@@ -453,15 +618,46 @@ async fn serve_html_root(State(state): State<SharedMarkdownState>) -> impl IntoR
 
     let filename = match state.get_sorted_filenames().into_iter().next() {
         Some(name) => name,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("No files available to serve".to_string()),
-            );
-        }
+        // Nothing indexed yet: either the background scan is still running, or
+        // the directory has no markdown in it. Both are served as a live page
+        // that replaces itself once a file shows up.
+        None => return render_empty_page(&state),
     };
 
     render_markdown(&state, &filename).await
+}
+
+/// The page shown at `/` before any markdown file is known. It carries the
+/// live-reload script and is marked as a placeholder, so the client reloads as
+/// soon as the file list becomes non-empty.
+fn render_empty_page(state: &MarkdownState) -> (StatusCode, Html<String>) {
+    let message = if state.scanning {
+        "Scanning for markdown files…"
+    } else {
+        "No markdown files found."
+    };
+
+    let env = template_env();
+    let Ok(template) = env.get_template(TEMPLATE_NAME) else {
+        return (StatusCode::OK, Html(message.to_string()));
+    };
+
+    let rendered = template
+        .render(context! {
+            content => Value::from_safe_string(format!("<p>{message}</p>")),
+            mermaid_enabled => false,
+            show_navigation => state.show_navigation(),
+            files => Vec::<Value>::new(),
+            current_file => "",
+            page_title => "mdserve",
+            standalone => state.standalone,
+            mermaid_js => "",
+            panzoom_js => "",
+            awaiting_files => true,
+        })
+        .unwrap_or_else(|e| format!("Rendering error: {e}"));
+
+    (StatusCode::OK, Html(rendered))
 }
 
 async fn serve_file(
@@ -527,6 +723,13 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
                 Value::from_object({
                     let mut map = std::collections::HashMap::new();
                     map.insert("name".to_string(), Value::from(name.clone()));
+                    // Build the href ourselves so path separators stay as "/"
+                    // instead of being autoescaped to "&#x2f;". Each path
+                    // component is still HTML-escaped to stay XSS-safe.
+                    map.insert(
+                        "href".to_string(),
+                        Value::from_safe_string(format!("/{}", html_escape_keep_slash(name))),
+                    );
                     map
                 })
             })
@@ -830,7 +1033,7 @@ mod tests {
     fn test_scan_markdown_files_empty_directory() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
 
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        let result = scan_markdown_files(temp_dir.path(), false).expect("Failed to scan");
         assert_eq!(result.len(), 0);
     }
 
@@ -845,7 +1048,7 @@ mod tests {
         fs::write(temp_dir.path().join("test.txt"), "text").expect("Failed to write");
         fs::write(temp_dir.path().join("README"), "readme").expect("Failed to write");
 
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        let result = scan_markdown_files(temp_dir.path(), false).expect("Failed to scan");
 
         assert_eq!(result.len(), 3);
 
@@ -857,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_markdown_files_ignores_subdirectories() {
+    fn test_scan_markdown_files_non_recursive_ignores_subdirectories() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
 
         fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
@@ -866,10 +1069,117 @@ mod tests {
         fs::create_dir(&sub_dir).expect("Failed to create subdir");
         fs::write(sub_dir.join("nested.md"), "# Nested").expect("Failed to write");
 
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        let result = scan_markdown_files(temp_dir.path(), false).expect("Failed to scan");
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file_name().unwrap().to_str().unwrap(), "root.md");
+    }
+
+    #[test]
+    fn test_scan_markdown_files_recursive_includes_subdirectories() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+
+        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
+
+        let sub_dir = temp_dir.path().join("subdir");
+        fs::create_dir(&sub_dir).expect("Failed to create subdir");
+        fs::write(sub_dir.join("nested.md"), "# Nested").expect("Failed to write");
+
+        let deep_dir = sub_dir.join("deeper");
+        fs::create_dir(&deep_dir).expect("Failed to create nested subdir");
+        fs::write(deep_dir.join("deep.md"), "# Deep").expect("Failed to write");
+
+        let result = scan_markdown_files(temp_dir.path(), true).expect("Failed to scan");
+
+        assert_eq!(result.len(), 3);
+        let filenames: Vec<_> = result
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(filenames.contains(&"root.md"));
+        assert!(filenames.contains(&"nested.md"));
+        assert!(filenames.contains(&"deep.md"));
+    }
+
+    #[test]
+    fn test_scan_markdown_files_recursive_skips_hidden_directories() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+
+        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
+
+        // The `ignore` crate skips hidden directories by default, so markdown
+        // inside e.g. `.git` should never be picked up.
+        let hidden_dir = temp_dir.path().join(".git");
+        fs::create_dir(&hidden_dir).expect("Failed to create hidden dir");
+        fs::write(hidden_dir.join("COMMIT_EDITMSG.md"), "# Hidden").expect("Failed to write");
+
+        let result = scan_markdown_files(temp_dir.path(), true).expect("Failed to scan");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].file_name().unwrap().to_str().unwrap(), "root.md");
+    }
+
+    /// Builds a repository whose `.gitignore` blanket-excludes `tasks/`, with a
+    /// second `.gitignore` inside `tasks/notes/` excluding `drafts/`.
+    fn ignored_subdir_repo() -> TempDir {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        // The ancestor search stops at the repository root, so mark one.
+        fs::create_dir(root.join(".git")).expect("Failed to create .git");
+        fs::write(root.join(".gitignore"), "tasks/**\n").expect("Failed to write");
+        fs::write(root.join("readme.md"), "# Readme").expect("Failed to write");
+
+        let notes = root.join("tasks").join("notes");
+        fs::create_dir_all(&notes).expect("Failed to create dirs");
+        fs::write(notes.join("kept.md"), "# Kept").expect("Failed to write");
+        fs::write(notes.join(".gitignore"), "drafts/\n").expect("Failed to write");
+
+        let drafts = notes.join("drafts");
+        fs::create_dir(&drafts).expect("Failed to create drafts dir");
+        fs::write(drafts.join("draft.md"), "# Draft").expect("Failed to write");
+
+        temp_dir
+    }
+
+    #[test]
+    fn test_scan_markdown_files_explicit_path_overrides_parent_gitignore() {
+        let temp_dir = ignored_subdir_repo();
+        let notes = temp_dir.path().join("tasks").join("notes");
+
+        let result = scan_markdown_files(&notes, true).expect("Failed to scan");
+
+        let names: Vec<_> = result
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        // Naming the directory overrides the repo's `tasks/**` rule, ...
+        assert!(
+            names.contains(&"kept.md"),
+            "explicitly served directory should be scanned despite parent .gitignore, got {names:?}"
+        );
+        // ... but ignore files inside the served tree still apply.
+        assert!(
+            !names.contains(&"draft.md"),
+            "a .gitignore inside the served directory should still be honored, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_markdown_files_honors_gitignore_below_the_served_directory() {
+        let temp_dir = ignored_subdir_repo();
+
+        let result = scan_markdown_files(temp_dir.path(), true).expect("Failed to scan");
+
+        let names: Vec<_> = result
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["readme.md"],
+            "serving the repo root keeps its own .gitignore in force"
+        );
     }
 
     #[test]
@@ -881,7 +1191,7 @@ mod tests {
         fs::write(temp_dir.path().join("test3.Md"), "# Test 3").expect("Failed to write");
         fs::write(temp_dir.path().join("test4.MARKDOWN"), "# Test 4").expect("Failed to write");
 
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        let result = scan_markdown_files(temp_dir.path(), false).expect("Failed to scan");
 
         assert_eq!(result.len(), 4);
     }
@@ -959,8 +1269,15 @@ mod tests {
         let tracked_files = vec![canonical_path];
         let is_directory_mode = false;
 
-        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
-            .expect("Failed to create router");
+        let router = new_router(
+            base_dir,
+            tracked_files,
+            is_directory_mode,
+            false,
+            false,
+            false,
+        )
+        .expect("Failed to create router");
 
         let server = if use_http {
             TestServer::builder()
@@ -993,11 +1310,19 @@ mod tests {
             .expect("Failed to write test3.md");
 
         let base_dir = temp_dir.path().to_path_buf();
-        let tracked_files = scan_markdown_files(&base_dir).expect("Failed to scan markdown files");
+        let tracked_files =
+            scan_markdown_files(&base_dir, true).expect("Failed to scan markdown files");
         let is_directory_mode = true;
 
-        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
-            .expect("Failed to create router");
+        let router = new_router(
+            base_dir,
+            tracked_files,
+            is_directory_mode,
+            true,
+            true,
+            false,
+        )
+        .expect("Failed to create router");
 
         let server = if use_http {
             TestServer::builder()
@@ -1013,6 +1338,125 @@ mod tests {
 
     async fn create_directory_server() -> (TestServer, TempDir) {
         create_directory_server_impl(false)
+    }
+
+    #[tokio::test]
+    async fn test_recursive_directory_serves_nested_files() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+
+        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
+
+        let sub_dir = temp_dir.path().join("docs");
+        fs::create_dir(&sub_dir).expect("Failed to create subdir");
+        fs::write(sub_dir.join("nested.md"), "# Nested page").expect("Failed to write");
+
+        let base_dir = temp_dir
+            .path()
+            .canonicalize()
+            .expect("Failed to canonicalize base dir");
+        let tracked_files =
+            scan_markdown_files(&base_dir, true).expect("Failed to scan markdown files");
+        let router = new_router(base_dir, tracked_files, true, false, true, false)
+            .expect("Failed to create router");
+        let server = TestServer::new(router).expect("Failed to create test server");
+
+        // Nested file is addressable at its relative-path URL.
+        let response = server.get("/docs/nested.md").await;
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("Nested page"));
+
+        // The sidebar links to it using the relative path.
+        let root = server.get("/").await;
+        assert_eq!(root.status_code(), 200);
+        assert!(
+            root.text().contains(r#"href="/docs/nested.md""#),
+            "sidebar should link to the nested file by relative path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_scan_indexes_the_directory_after_startup() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        fs::write(temp_dir.path().join("root.md"), "# Root page").expect("Failed to write");
+        let sub_dir = temp_dir.path().join("docs");
+        fs::create_dir(&sub_dir).expect("Failed to create subdir");
+        fs::write(sub_dir.join("nested.md"), "# Nested page").expect("Failed to write");
+
+        let base_dir = temp_dir
+            .path()
+            .canonicalize()
+            .expect("Failed to canonicalize base dir");
+        // No files are handed over: the server starts empty and finds them itself.
+        let router = new_router(base_dir, Vec::new(), true, false, true, true)
+            .expect("Failed to create router");
+        let server = TestServer::new(router).expect("Failed to create test server");
+
+        // The walk emits directories in whatever order the OS lists them, so
+        // wait for both files rather than treating either one as "done".
+        let mut body = String::new();
+        for _ in 0..100 {
+            body = server.get("/").await.text();
+            if body.contains(r#"href="/root.md""#) && body.contains(r#"href="/docs/nested.md""#) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            body.contains(r#"href="/root.md""#),
+            "background scan should have indexed the directory"
+        );
+        assert!(
+            body.contains(r#"href="/docs/nested.md""#),
+            "background scan should recurse into subdirectories"
+        );
+        assert!(
+            server
+                .get("/docs/nested.md")
+                .await
+                .text()
+                .contains("Nested page"),
+            "a file found by the background scan should be servable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_directory_serves_a_page_instead_of_failing() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir
+            .path()
+            .canonicalize()
+            .expect("Failed to canonicalize base dir");
+        let router = new_router(base_dir, Vec::new(), true, false, true, true)
+            .expect("Failed to create router");
+        let server = TestServer::new(router).expect("Failed to create test server");
+
+        // A directory with no markdown is a live page that fills in when one is
+        // written, not a startup error.
+        assert_eq!(server.get("/").await.status_code(), 200);
+    }
+
+    #[test]
+    fn test_empty_page_distinguishes_scanning_from_finished() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().to_path_buf();
+
+        let scanning = MarkdownState::new(base_dir.clone(), Vec::new(), true, false, true)
+            .expect("Failed to build state");
+        let (status, body) = render_empty_page(&scanning);
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.0.contains("Scanning for markdown files"));
+        assert!(
+            body.0.contains("data-awaiting-files"),
+            "the client needs the marker to reload once the first file lands"
+        );
+
+        let finished = MarkdownState::new(base_dir, Vec::new(), true, false, false)
+            .expect("Failed to build state");
+        assert!(render_empty_page(&finished)
+            .1
+             .0
+            .contains("No markdown files found"));
     }
 
     async fn create_directory_server_with_http() -> (TestServer, TempDir) {
@@ -1131,8 +1575,15 @@ fn main() {
         let base_dir = temp_dir.path().to_path_buf();
         let tracked_files = vec![md_path];
         let is_directory_mode = false;
-        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
-            .expect("Failed to create router");
+        let router = new_router(
+            base_dir,
+            tracked_files,
+            is_directory_mode,
+            false,
+            false,
+            false,
+        )
+        .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
         let response = server.get("/").await;
@@ -1160,8 +1611,15 @@ fn main() {
         let base_dir = temp_dir.path().to_path_buf();
         let tracked_files = vec![md_path];
         let is_directory_mode = false;
-        let router = new_router(base_dir, tracked_files, is_directory_mode, false)
-            .expect("Failed to create router");
+        let router = new_router(
+            base_dir,
+            tracked_files,
+            is_directory_mode,
+            false,
+            false,
+            false,
+        )
+        .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
         let response = server.get("/secret.txt").await;
@@ -1435,7 +1893,7 @@ classDiagram
             .canonicalize()
             .unwrap_or_else(|_| temp_file.path().to_path_buf());
         let base_dir = canonical_path.parent().unwrap().to_path_buf();
-        let router = new_router(base_dir, vec![canonical_path], false, true).unwrap();
+        let router = new_router(base_dir, vec![canonical_path], false, true, false, false).unwrap();
         let server = TestServer::new(router).unwrap();
 
         let body = server.get("/").await.text();
@@ -1481,7 +1939,7 @@ classDiagram
             .canonicalize()
             .unwrap_or_else(|_| temp_file.path().to_path_buf());
         let base_dir = canonical_path.parent().unwrap().to_path_buf();
-        let router = new_router(base_dir, vec![canonical_path], false, true).unwrap();
+        let router = new_router(base_dir, vec![canonical_path], false, true, false, false).unwrap();
         let server = TestServer::new(router).unwrap();
 
         let body = server.get("/").await.text();
@@ -1643,7 +2101,18 @@ classDiagram
         )
         .await;
 
-        update_result.expect("Timeout waiting for WebSocket update after new file creation");
+        let message =
+            update_result.expect("Timeout waiting for WebSocket update after new file creation");
+
+        // A new file leaves the open page untouched, so clients get the file
+        // list to refresh their sidebar rather than a full reload.
+        match message {
+            ServerMessage::Files { files, scanning } => {
+                assert!(files.contains(&"test4.md".to_string()), "got {files:?}");
+                assert!(!scanning, "the initial scan is not running in this server");
+            }
+            other => panic!("expected a file-list update, got {other:?}"),
+        }
 
         let response = server.get("/test1.md").await;
         assert_eq!(response.status_code(), 200);

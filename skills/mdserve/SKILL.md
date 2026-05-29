@@ -62,8 +62,15 @@ command: mdserve --open docs/
 run_in_background: true
 ```
 
-This gives the user a sidebar to navigate between files. Only the
-immediate directory is watched (non-recursive).
+This gives the user a sidebar to navigate between files. By default the
+directory is scanned recursively, so files in subdirectories appear too
+(respecting `.gitignore` and skipping hidden directories like `.git`).
+Pass `--no-recursive` to scan only the immediate directory.
+
+The scan runs in the background, so the server is up right away and the
+sidebar fills in as files are found — passing a large tree is fine. A
+directory you name explicitly is served even if a `.gitignore` above it
+excludes it, so `mdserve tasks/emails` works in a repo that ignores `tasks/`.
 
 ## Mermaid diagrams
 

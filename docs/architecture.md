@@ -41,7 +41,7 @@ mdserve ./docs/
 
 Central state stores:
 - Base directory path
-- HashMap of tracked files (filename → metadata + pre-rendered HTML)
+- HashMap of tracked files (base-directory-relative path → metadata + pre-rendered HTML)
 - Directory mode flag (determines UI)
 - WebSocket broadcast channel
 
@@ -78,43 +78,67 @@ tracked_files = {
 is_directory_mode = false
 ```
 
-Directory mode:
+Directory mode (recursive):
 ```
 base_dir = /path/to/docs/
 tracked_files = {
   "api.md": TrackedFile { ... },
   "guide.md": TrackedFile { ... },
+  "reference/errors.md": TrackedFile { ... },
   "README.md": TrackedFile { ... }
 }
 is_directory_mode = true
 ```
 
+### Background Scanning
+
+In directory mode the server starts with no tracked files and walks the tree on
+a blocking task, rendering and inserting each markdown file as it is found. The
+growing file list is broadcast to clients at most once every 100ms
+(`SCAN_UPDATE_INTERVAL`), with a final message when the walk finishes. Indexing
+a tree of thousands of files therefore never delays the first response.
+
+`GET /` before the first file is found returns a live placeholder page ("Scanning
+for markdown files…", or "No markdown files found." once the walk is done) marked
+with `data-awaiting-files`; the client reloads it as soon as the list is
+non-empty. An empty directory is a page, not a startup error.
+
+The walk drops ignore files *above* the served directory when they would exclude
+it (`ignored_by_ancestor`), so naming a directory on the command line overrides a
+parent `.gitignore`. Ignore files inside the served tree still apply.
+
 ### Live Reload
 
-Uses [notify](https://github.com/notify-rs/notify) crate to watch base directory (non-recursive):
+Uses [notify](https://github.com/notify-rs/notify) crate to watch the base directory (recursively by default, or non-recursively with `--no-recursive`):
 - Create/modify: Refresh file, add if new (directory mode only)
 - Delete: Remove from tracking
 - Rename: Remove old, add new
-- All changes trigger WebSocket reload broadcast
+- All changes trigger a WebSocket broadcast
 
 File changes flow:
 1. File system event detected by `notify`
 2. Markdown re-rendered to HTML
 3. State updated (refresh/add/remove tracked file)
-4. `ServerMessage::Reload` broadcast via WebSocket channel
-5. All connected clients receive reload message
-6. Clients execute `window.location.reload()`
+4. Broadcast via WebSocket channel: `ServerMessage::Reload` when a tracked file's
+   content changed, or `ServerMessage::Files` when only the set of files did
+5. All connected clients receive the message
+6. Clients execute `window.location.reload()`, or rebuild the sidebar in place
+   for `Files` — a new file must not throw away the page being read
 
 ### Routing
 
 Single unified router handles both modes:
 - `GET /` → First file alphabetically
-- `GET /:filename.md` → Specific markdown file
-- `GET /:filename.<ext>` → Images from base directory
+- `GET /*path.md` → Specific markdown file, keyed by its path relative to the base directory (e.g. `sub/dir/notes.md`)
+- `GET /*path.<ext>` → Images from the base directory (including subdirectories)
 - `GET /ws` → WebSocket connection
 - `GET /mermaid.min.js` → Bundled Mermaid library
 
-The `:filename` pattern rejects paths with `/`, preventing directory traversal.
+Tracked files are keyed by their base-directory-relative path, so the wildcard
+`*path` route can address files in subdirectories. Directory traversal is
+prevented not by rejecting `/`, but because markdown requests must match a
+tracked-file key and image requests are canonicalized and checked to remain
+within the base directory.
 
 ### Rendering
 
@@ -131,19 +155,24 @@ Template variables:
 - `show_navigation`: Controls sidebar visibility
 - `files`: List of tracked files (directory mode)
 - `current_file`: Active file name (directory mode)
+- `awaiting_files`: Marks the placeholder page shown before any file is indexed
 
 ## Design Decisions
 
 **Unified architecture**: Single code path handles both single-file and directory modes. Mode determined by user intent, not file count.
 
-**Pre-rendered caching**: All tracked files rendered to HTML in memory on startup and file change. Serving always from memory, never from disk.
+**Pre-rendered caching**: All tracked files rendered to HTML in memory as they are discovered and on file change. Serving always from memory, never from disk.
 
-**Non-recursive watching**: Only immediate directory, no subdirectories. Simplifies security and state management.
+**Recursive watching by default**: Subdirectories are scanned and watched, using the [`ignore`](https://docs.rs/ignore) crate to honor `.gitignore`/`.ignore` rules and skip hidden directories. `--no-recursive` limits this to the immediate directory.
 
-**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript minimal (theme management, reload execution).
+**Explicit paths outrank parent ignore rules**: Passing a directory is a request to serve it, so a `.gitignore` above it is not consulted for the walk. This keeps the common `mdserve tasks/emails` case working in repos that ignore `tasks/`, while ignore files inside the served tree still take effect.
+
+**Scan in the background**: Serving starts immediately and the file list streams to clients, rather than making startup wait on a full walk. The cost is that a file can 404 briefly before the scan reaches it.
+
+**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript stays small (theme management, reload execution, sidebar list updates).
 
 ## Constraints
 
-- Non-recursive (flat directories only)
-- Alphabetical file ordering only
+- Recursive by default (`--no-recursive` for flat directories only)
+- Alphabetical file ordering only (by relative path)
 - All files pre-rendered in memory

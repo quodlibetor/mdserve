@@ -31,12 +31,18 @@ minijinja-embed (changes to `templates/` require a rebuild).
   during coding sessions. Features that push it toward a documentation platform,
   configurable server, or deployment target are out of scope.
 - **Zero config.** `mdserve file.md` must work with no flags or config files.
-- **Non-recursive.** Directory mode watches only the immediate directory, never
-  subdirectories. This is intentional.
-- **Pre-rendered in memory.** All tracked files are rendered to HTML on startup
-  and on change. Serving is always from memory.
+- **Recursive by default.** Directory mode scans and watches subdirectories,
+  respecting `.gitignore` and skipping hidden directories (via the `ignore`
+  crate). `--no-recursive` restores immediate-directory-only behavior. An
+  explicitly served directory outranks ignore rules above it, so
+  `mdserve tasks/emails` works where `tasks/` is gitignored.
+- **Serving starts before scanning finishes.** The directory scan runs in the
+  background and streams the file list to clients, so tree size never delays
+  the first page.
+- **Pre-rendered in memory.** All tracked files are rendered to HTML as they are
+  discovered and on change. Serving is always from memory.
 - **Minimal client-side JS.** Most logic is server-side. Client JS handles
-  theme selection and WebSocket reload only.
+  theme selection, WebSocket reload, and swapping in the sidebar file list.
 
 ## Changelog
 

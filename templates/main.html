@@ -840,6 +840,35 @@
             releaseModalFocus(modal);
         }
 
+        // Replaces the sidebar links with `files`. The server streams this list
+        // while it walks a directory in the background, so a large tree fills in
+        // without disturbing the page being read. A page that has nothing to show
+        // yet reloads instead, to pick up the first file the scan finds.
+        function updateFileList(files) {
+            if (document.body.dataset.awaitingFiles !== undefined && files.length > 0) {
+                window.location.reload();
+                return;
+            }
+            const list = document.querySelector('.file-list');
+            if (!list) {
+                return;
+            }
+            const current = document.body.dataset.currentFile;
+            list.replaceChildren(...files.map(function(name) {
+                const link = document.createElement('a');
+                // Built with the DOM rather than markup, so a filename cannot
+                // inject HTML. Matches the server-rendered href exactly.
+                link.setAttribute('href', '/' + name);
+                link.textContent = name;
+                if (name === current) {
+                    link.className = 'active';
+                }
+                const item = document.createElement('li');
+                item.appendChild(link);
+                return item;
+            }));
+        }
+
         // Auto-refresh functionality using WebSocket.
         // Skip on file:// — the page was saved and there is no server to reach.
         function setupLiveReload() {
@@ -860,6 +889,8 @@
                     if (message.type === 'Reload') {
                         console.log('Reloading page via WebSocket');
                         window.location.reload();
+                    } else if (message.type === 'Files') {
+                        updateFileList(message.files);
                     }
                 } catch (error) {
                     console.error('Error parsing WebSocket message:', error);
@@ -914,7 +945,7 @@
         });
     </script>
 </head>
-<body>
+<body{% if show_navigation %} data-current-file="{{ current_file }}"{% endif %}{% if awaiting_files %} data-awaiting-files{% endif %}>
 {% if show_navigation %}
 <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar">
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -928,7 +959,7 @@
         <ul class="file-list">
             {% for file in files %}
             <li>
-                <a href="/{{ file.name }}"{% if file.name == current_file %} class="active"{% endif %}>
+                <a href="{{ file.href }}"{% if file.name == current_file %} class="active"{% endif %}>
                     {{ file.name }}
                 </a>
             </li>

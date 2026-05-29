@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 mod app;
 
-use app::{scan_markdown_files, serve_markdown};
+use app::serve_markdown;
 
 #[derive(Parser)]
 #[command(name = "mdserve")]
@@ -30,11 +30,21 @@ struct Args {
     /// diagrams without the server
     #[arg(long)]
     standalone: bool,
+
+    /// Recursively scan subdirectories for markdown files (directory mode).
+    /// Enabled by default; honors .gitignore and skips hidden directories.
+    #[arg(long, overrides_with = "no_recursive")]
+    recursive: bool,
+
+    /// Scan only the immediate directory, not subdirectories (directory mode)
+    #[arg(long = "no-recursive", overrides_with = "recursive")]
+    no_recursive: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let recursive = !args.no_recursive;
     let absolute_path = args.path.canonicalize().unwrap_or(args.path);
 
     let (base_dir, tracked_files, is_directory_mode) = if absolute_path.is_file() {
@@ -46,12 +56,9 @@ async fn main() -> Result<()> {
         let tracked_files = vec![absolute_path];
         (base_dir, tracked_files, false)
     } else if absolute_path.is_dir() {
-        // Directory mode: scan directory for markdown files
-        let tracked_files = scan_markdown_files(&absolute_path)?;
-        if tracked_files.is_empty() {
-            anyhow::bail!("No markdown files found in directory");
-        }
-        (absolute_path, tracked_files, true)
+        // Directory mode: the scan runs in the background once the server is up,
+        // so a large tree doesn't hold up the first page.
+        (absolute_path, Vec::new(), true)
     } else {
         anyhow::bail!("Path must be a file or directory");
     };
@@ -65,6 +72,9 @@ async fn main() -> Result<()> {
         args.port,
         args.open,
         args.standalone,
+        // Recursion only applies to directory mode; single-file mode never
+        // watches the parent directory's subtree.
+        is_directory_mode && recursive,
     )
     .await?;
 
