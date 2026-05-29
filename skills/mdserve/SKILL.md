@@ -77,6 +77,12 @@ Use Mermaid diagrams when they improve clarity over plain text:
 Prefer Mermaid over ASCII art when the diagram has more than a few
 elements or shows relationships and flow.
 
+Diagrams render in the browser, but parse errors stream back to the
+terminal running mdserve (the background task output), printed with the
+failing diagram's source. After adding or editing a diagram, check that
+output: if a diagram fails to render, the error appears there so you can
+fix the syntax.
+
 ## Installation
 
 mdserve must be installed on the user's system. If the `mdserve`

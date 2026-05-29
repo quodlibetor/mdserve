@@ -6,8 +6,8 @@ use axum::{
     },
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use minijinja::{context, value::Value, Environment};
@@ -310,6 +310,7 @@ fn new_router(
     let router = Router::new()
         .route("/", get(serve_html_root))
         .route("/ws", get(websocket_handler))
+        .route("/api/mermaid-error", post(log_mermaid_error))
         .route("/mermaid.min.js", get(serve_mermaid_js))
         .route("/panzoom.min.js", get(serve_panzoom_js))
         .route("/*filename", get(serve_file))
@@ -693,6 +694,31 @@ async fn websocket_handler(
     State(state): State<SharedMarkdownState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_websocket(socket, state))
+}
+
+/// A client-reported mermaid render failure. The browser renders mermaid
+/// diagrams, so parse errors are only visible there; the client posts them
+/// back here so they surface in the terminal running the server.
+#[derive(Debug, Deserialize)]
+struct MermaidErrorReport {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    source: String,
+    message: String,
+}
+
+async fn log_mermaid_error(Json(report): Json<MermaidErrorReport>) -> StatusCode {
+    let id = if report.id.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        report.id
+    };
+    eprintln!("⚠ mermaid render error in diagram {id}: {}", report.message);
+    if !report.source.is_empty() {
+        eprintln!("{}", report.source);
+    }
+    StatusCode::NO_CONTENT
 }
 
 async fn handle_websocket(socket: WebSocket, state: SharedMarkdownState) {
@@ -1216,6 +1242,39 @@ console.log("Hello World");
         assert!(body.contains("function getMermaidTheme()"));
         assert!(body.contains(r#"class="language-javascript""#));
         assert!(body.contains("console.log"));
+    }
+
+    #[tokio::test]
+    async fn test_mermaid_error_endpoint_accepts_report() {
+        let (server, _temp_file) = create_test_server("# Mermaid Error Test").await;
+
+        let response = server
+            .post("/api/mermaid-error")
+            .json(&serde_json::json!({
+                "id": "mermaid-0",
+                "source": "graph TD\n  A --> ",
+                "message": "Parse error on line 2"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 204);
+    }
+
+    #[tokio::test]
+    async fn test_mermaid_error_endpoint_requires_message() {
+        let (server, _temp_file) = create_test_server("# Mermaid Error Test").await;
+
+        // Missing the required `message` field should be rejected.
+        let response = server
+            .post("/api/mermaid-error")
+            .json(&serde_json::json!({ "id": "mermaid-0" }))
+            .await;
+
+        assert!(
+            response.status_code().is_client_error(),
+            "expected 4xx for missing message, got {}",
+            response.status_code()
+        );
     }
 
     #[tokio::test]

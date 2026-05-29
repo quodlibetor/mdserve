@@ -689,8 +689,42 @@
                 // Find and transform mermaid code blocks
                 transformMermaidCodeBlocks();
 
-                mermaid.run();
+                runMermaid();
             }
+        }
+
+        // Render mermaid diagrams one at a time so a parse error in one diagram
+        // is logged to the console (with its source) instead of being silently
+        // swallowed, and doesn't prevent other diagrams from rendering. The
+        // renders MUST run sequentially: mermaid shares a global id counter and
+        // a temporary measurement element, so firing multiple mermaid.run()
+        // calls concurrently makes them collide and collapse into one slot.
+        async function runMermaid() {
+            const nodes = document.querySelectorAll('.mermaid');
+            for (const node of nodes) {
+                try {
+                    await mermaid.run({ nodes: [node], suppressErrors: false });
+                } catch (err) {
+                    reportMermaidError(node, err);
+                }
+            }
+        }
+
+        function reportMermaidError(node, err) {
+            const source = node.getAttribute('data-original') || node.textContent;
+            const id = node.id || '(unknown)';
+            const message = (err && err.message) ? err.message : String(err);
+            console.error(
+                `mermaid: failed to render diagram #${id}\n${source}`,
+                err
+            );
+            // Report back so the error also shows in the terminal running mdserve.
+            fetch('/api/mermaid-error', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, source, message }),
+                keepalive: true
+            }).catch(() => {});
         }
 
         function transformMermaidCodeBlocks() {
@@ -759,7 +793,7 @@
                     }
                 });
 
-                mermaid.run();
+                runMermaid();
             }
         }
 
