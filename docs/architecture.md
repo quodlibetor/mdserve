@@ -143,7 +143,9 @@ within the base directory.
 
 ### Rendering
 
-Uses [MiniJinja](https://github.com/mitsuhiko/minijinja) (Jinja2 template syntax) with templates embedded at compile time via [minijinja_embed](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-embed).
+Markdown is rendered to HTML with [markdown-rs](https://github.com/wooorm/markdown-rs); rendered headings then get GitHub-style slug `id` attributes so in-page `#anchor` links resolve, both in the live preview and the offline bundle.
+
+The page is assembled with [MiniJinja](https://github.com/mitsuhiko/minijinja) (Jinja2 template syntax) with templates embedded at compile time via [minijinja_embed](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-embed).
 
 Conditional template rendering:
 - Directory mode: Includes navigation sidebar with active file highlighting

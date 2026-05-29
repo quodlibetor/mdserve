@@ -543,9 +543,31 @@
             margin-bottom: 16px;
             font-weight: 600;
             line-height: 1.25;
+            position: relative;
         }
         h1 { border-bottom: 1px solid var(--border-color); padding-bottom: 8px; }
         h2 { border-bottom: 1px solid var(--border-color); padding-bottom: 8px; }
+        /* Clickable anchor link revealed on heading hover (GitHub-style) */
+        .heading-anchor {
+            position: absolute;
+            left: -1.15em;
+            top: 0;
+            display: inline-flex;
+            align-items: center;
+            height: 1.25em;
+            padding-right: 0.25em;
+            color: var(--blockquote-color);
+            opacity: 0;
+            transition: opacity 0.1s ease-in;
+        }
+        .heading-anchor:hover { text-decoration: none; color: var(--link-color); }
+        h1:hover > .heading-anchor,
+        h2:hover > .heading-anchor,
+        h3:hover > .heading-anchor,
+        h4:hover > .heading-anchor,
+        h5:hover > .heading-anchor,
+        h6:hover > .heading-anchor,
+        .heading-anchor:focus { opacity: 1; }
         a { color: var(--link-color); text-decoration: none; }
         a:hover { text-decoration: underline; }
         img { max-width: 100%; height: auto; }

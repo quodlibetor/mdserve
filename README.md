@@ -22,8 +22,8 @@ WebSocket. This is the core interaction: an agent writes, a human reads.
 done. mdserve is not a long-running server and doesn't need to be.
 
 **Agent-friendly content.** Full GFM support (tables, task lists, code blocks),
-Mermaid diagrams, and directory mode with sidebar navigation - the kinds of
-content AI coding agents actually produce.
+Mermaid diagrams, heading anchors for in-page `#links`, and directory mode with
+sidebar navigation - the kinds of content AI coding agents actually produce.
 
 **Offline bundle download.** The ⬇️ button (or `GET /api/download`) packages the
 served markdown as a self-contained `.zip`: each file rendered to offline HTML

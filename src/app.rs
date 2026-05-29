@@ -341,7 +341,123 @@ fn markdown_to_html_inner(content: &str, allow_dangerous_protocol: bool) -> Resu
     let html_body = markdown::to_html_with_options(content, &options)
         .unwrap_or_else(|_| "Error parsing markdown".to_string());
 
-    Ok(html_body)
+    Ok(add_heading_ids(&html_body))
+}
+
+/// Link (chain) octicon shown on heading hover, linking to the heading's anchor.
+const HEADING_ANCHOR_ICON: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 2 2 0 0 0 2.83 0l2.5-2.5a2 2 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a2 2 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 2 2 0 0 0-2.83 0l-2.5 2.5a2 2 0 0 0 0 2.83Z"></path></svg>"##;
+
+/// Adds GitHub-style slug `id` attributes to `<h1>`..`<h6>` tags so in-page
+/// `#anchor` links resolve, and injects a clickable anchor link (shown on hover)
+/// into each. Only plain (attribute-less) heading tags emitted by the markdown
+/// renderer are touched; author-written headings that already have attributes
+/// are left alone. Duplicate slugs get a `-1`, `-2`, ... suffix.
+fn add_heading_ids(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 64);
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut rest = html;
+
+    while let Some((pos, level)) = next_heading_open(rest) {
+        out.push_str(&rest[..pos]);
+        let after_open = pos + 4; // past "<hN>"
+        let close = format!("</h{level}>");
+        let Some(crel) = rest[after_open..].find(&close) else {
+            // Unterminated heading: emit as-is and stop transforming.
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let inner = &rest[after_open..after_open + crel];
+        let slug = unique_slug(&slugify(&strip_html_tags(inner)), &mut seen);
+        if slug.is_empty() {
+            out.push_str(&format!("<h{level}>"));
+        } else {
+            out.push_str(&format!(
+                "<h{level} id=\"{slug}\">\
+                 <a class=\"heading-anchor\" href=\"#{slug}\" aria-label=\"Permalink to this heading\">{HEADING_ANCHOR_ICON}</a>"
+            ));
+        }
+        out.push_str(inner);
+        out.push_str(&close);
+        rest = &rest[after_open + crel + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Finds the next plain heading open tag (`<h1>`..`<h6>`), returning its byte
+/// offset and level digit.
+fn next_heading_open(s: &str) -> Option<(usize, char)> {
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find("<h") {
+        let idx = from + rel;
+        if idx + 3 < s.len() && bytes[idx + 3] == b'>' && bytes[idx + 2].is_ascii_digit() {
+            let level = bytes[idx + 2] as char;
+            if ('1'..='6').contains(&level) {
+                return Some((idx, level));
+            }
+        }
+        from = idx + 2;
+    }
+    None
+}
+
+/// Strips HTML tags and decodes a few basic entities to recover heading text.
+fn strip_html_tags(s: &str) -> String {
+    let mut text = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    // `&amp;` last so entities aren't double-decoded.
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// GitHub-ish slug: lowercase; keep alphanumerics and `_`; turn whitespace and
+/// `-` runs into a single `-`; drop other punctuation; trim leading/trailing `-`.
+fn slugify(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len());
+    let mut pending_hyphen = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if pending_hyphen && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_hyphen = false;
+            slug.extend(c.to_lowercase());
+        } else if c == '_' {
+            pending_hyphen = false;
+            slug.push('_');
+        } else if c.is_whitespace() || c == '-' {
+            pending_hyphen = true;
+        }
+        // any other punctuation is dropped
+    }
+    slug
+}
+
+/// Disambiguates a slug against previously-seen ones (`slug`, `slug-1`, ...).
+fn unique_slug(slug: &str, seen: &mut HashMap<String, usize>) -> String {
+    if slug.is_empty() {
+        return String::new();
+    }
+    let count = seen.entry(slug.to_string()).or_insert(0);
+    let result = if *count == 0 {
+        slug.to_string()
+    } else {
+        format!("{slug}-{count}")
+    };
+    *count += 1;
+    result
 }
 
 /// Handles a markdown file that may have been created or modified.
@@ -1236,6 +1352,32 @@ mod tests {
     }
 
     #[test]
+    fn test_headings_get_slug_ids() {
+        let md = "# Intro\n\n## Details Section\n\n## Details Section\n\n### Café & Bar!\n";
+        let html = markdown_to_html(md).unwrap();
+        assert!(html.contains(r#"<h1 id="intro">"#), "{html}");
+        assert!(html.contains(r#"<h2 id="details-section">"#), "{html}");
+        // Duplicate heading text gets a numeric suffix.
+        assert!(html.contains(r#"<h2 id="details-section-1">"#), "{html}");
+        // Punctuation dropped, spaces collapsed, unicode letters kept.
+        assert!(html.contains(r#"<h3 id="café-bar">"#), "{html}");
+        // Each heading gets a clickable anchor link to its own id.
+        assert!(
+            html.contains(r##"<h1 id="intro"><a class="heading-anchor" href="#intro""##),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn test_slugify_rules() {
+        assert_eq!(slugify("Hello, World!"), "hello-world");
+        assert_eq!(slugify("  leading and  trailing  "), "leading-and-trailing");
+        assert_eq!(slugify("keep_underscores"), "keep_underscores");
+        assert_eq!(slugify("a -- b"), "a-b");
+        assert_eq!(slugify("!!!"), "");
+    }
+
+    #[test]
     fn test_scan_markdown_files_empty_directory() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
 
@@ -1681,7 +1823,7 @@ mod tests {
         assert_eq!(response.status_code(), 200);
         let body = response.text();
 
-        assert!(body.contains("<h1>Hello World</h1>"));
+        assert!(body.contains("<h1 id=\"hello-world\">"));
         assert!(body.contains("<strong>bold</strong>"));
         assert!(body.contains("theme-toggle"));
         assert!(body.contains("openThemeModal"));
@@ -2466,19 +2608,19 @@ classDiagram
         let response1 = server.get("/test1.md").await;
         assert_eq!(response1.status_code(), 200);
         let body1 = response1.text();
-        assert!(body1.contains("<h1>Test 1</h1>"));
+        assert!(body1.contains("<h1 id=\"test-1\">"));
         assert!(body1.contains("Content of test1"));
 
         let response2 = server.get("/test2.markdown").await;
         assert_eq!(response2.status_code(), 200);
         let body2 = response2.text();
-        assert!(body2.contains("<h1>Test 2</h1>"));
+        assert!(body2.contains("<h1 id=\"test-2\">"));
         assert!(body2.contains("Content of test2"));
 
         let response3 = server.get("/test3.md").await;
         assert_eq!(response3.status_code(), 200);
         let body3 = response3.text();
-        assert!(body3.contains("<h1>Test 3</h1>"));
+        assert!(body3.contains("<h1 id=\"test-3\">"));
         assert!(body3.contains("Content of test3"));
     }
 
@@ -2631,7 +2773,7 @@ classDiagram
         let new_file_response = server.get("/test4.md").await;
         assert_eq!(new_file_response.status_code(), 200);
         let new_file_body = new_file_response.text();
-        assert!(new_file_body.contains("<h1>Test 4</h1>"));
+        assert!(new_file_body.contains("<h1 id=\"test-4\">"));
         assert!(new_file_body.contains("This is a new file"));
     }
 
@@ -2766,7 +2908,7 @@ classDiagram
 
         assert!(!body.contains("title: Test Post"));
         assert!(!body.contains("author: Name"));
-        assert!(body.contains("<h1>Test Post</h1>"));
+        assert!(body.contains("<h1 id=\"test-post\">"));
     }
 
     #[tokio::test]
@@ -2779,7 +2921,7 @@ classDiagram
         let body = response.text();
 
         assert!(!body.contains("title = \"Test Post\""));
-        assert!(body.contains("<h1>Test Post</h1>"));
+        assert!(body.contains("<h1 id=\"test-post\">"));
     }
 
     #[tokio::test]
