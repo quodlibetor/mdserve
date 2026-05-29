@@ -43,6 +43,11 @@ minijinja-embed (changes to `templates/` require a rebuild).
   discovered and on change. Serving is always from memory.
 - **Minimal client-side JS.** Most logic is server-side. Client JS handles
   theme selection, WebSocket reload, and swapping in the sidebar file list.
+- **Save/share, not deploy.** Capturing rendered output for the user to keep is
+  in scope (`--standalone`, the `/api/download` offline bundle). The offline
+  bundle may read local files outside the served directory to collect linked
+  dependencies, but only on loopback binds and only for same-origin requests, so
+  a networked server can't be turned into an arbitrary-file reader.
 
 ## Changelog
 

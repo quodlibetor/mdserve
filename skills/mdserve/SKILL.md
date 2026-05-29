@@ -72,6 +72,14 @@ sidebar fills in as files are found — passing a large tree is fine. A
 directory you name explicitly is served even if a `.gitignore` above it
 excludes it, so `mdserve tasks/emails` works in a repo that ignores `tasks/`.
 
+## Offline bundle
+
+The preview has a ⬇️ button (top-right) that downloads a `.zip` of
+self-contained HTML plus all locally-referenced assets and linked files,
+with links rewritten to work offline. Point the user to it when they want
+to save or share the rendered output without keeping the server running.
+No agent action is needed — it is a browser-side download.
+
 ## Mermaid diagrams
 
 Use Mermaid diagrams when they improve clarity over plain text:

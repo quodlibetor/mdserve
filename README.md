@@ -25,6 +25,11 @@ done. mdserve is not a long-running server and doesn't need to be.
 Mermaid diagrams, and directory mode with sidebar navigation - the kinds of
 content AI coding agents actually produce.
 
+**Offline bundle download.** The ⬇️ button (or `GET /api/download`) packages the
+served markdown as a self-contained `.zip`: each file rendered to offline HTML
+(sharing one bundled mermaid library), all locally-referenced assets and linked
+files collected recursively, and links rewritten so it works by double-clicking.
+
 ## What mdserve is not
 
 - **Not a documentation site generator.** Use mdBook, Docusaurus, or MkDocs
@@ -146,6 +151,24 @@ mdserve README.md --open
   fills in as files are found — a large tree never delays the first page
 - Serves a directory you name explicitly even when a parent `.gitignore`
   excludes it, so `mdserve tasks/emails` works in a repo that ignores `tasks/`
+
+
+## Offline bundle
+
+The ⬇️ button in the top-right (or `GET /api/download`) downloads a `.zip` you
+can open without a server. Every served markdown file is rendered to an offline
+HTML page; pages share a single bundled copy of the mermaid/panzoom libraries
+(under `_assets/`) so a bundle with many diagrams stays small. Local
+dependencies are collected recursively: images, PDFs, and linked markdown files
+are pulled in - including `file://` and absolute paths outside the served
+directory (placed under `_external/`) - with links rewritten to point at the
+bundled copies. External (`http(s)`, `mailto`, ...) links are left untouched.
+Directory mode bundles the whole tracked set plus a generated `index.html`.
+
+For safety, collecting files from *outside* the served directory only happens on
+loopback binds; when bound to a network interface (`--hostname 0.0.0.0`) the
+bundle stays within the served directory, and the endpoint refuses cross-origin
+requests.
 
 
 ## Themes

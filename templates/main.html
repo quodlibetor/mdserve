@@ -285,6 +285,11 @@
             outline: none;
         }
 
+        /* Sits just left of the theme toggle */
+        .download-toggle {
+            right: 64px;
+        }
+
         .theme-modal {
             display: none;
             position: fixed;
@@ -547,12 +552,15 @@
     </style>
 
     {% if mermaid_enabled %}
-    {% if standalone %}
+    {% if mermaid_js %}
     <script>{{ mermaid_js }}</script>
+    {% else %}
+    <script src="{{ mermaid_js_src }}"></script>
+    {% endif %}
+    {% if panzoom_js %}
     <script>{{ panzoom_js }}</script>
     {% else %}
-    <script src="/mermaid.min.js"></script>
-    <script src="/panzoom.min.js"></script>
+    <script src="{{ panzoom_js_src }}"></script>
     {% endif %}
     {% endif %}
     <script>
@@ -969,6 +977,10 @@
 </nav>
 {% endif %}
 
+{% if show_download %}
+<button class="theme-toggle download-toggle" onclick="window.location.href='/api/download'"
+        title="Download offline bundle (zip)" aria-label="Download offline bundle">⬇️</button>
+{% endif %}
 <button class="theme-toggle" onclick="openThemeModal()">🎨</button>
 <div id="content">
 {{ content }}

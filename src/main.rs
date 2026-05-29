@@ -3,6 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 mod app;
+mod bundle;
 
 use app::serve_markdown;
 

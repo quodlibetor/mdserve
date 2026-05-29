@@ -30,8 +30,8 @@ use tower_http::cors::CorsLayer;
 
 const TEMPLATE_NAME: &str = "main.html";
 static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
-const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
-const PANZOOM_JS: &str = include_str!("../static/js/panzoom.min.js");
+pub(crate) const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
+pub(crate) const PANZOOM_JS: &str = include_str!("../static/js/panzoom.min.js");
 const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "-mermaid\"");
 const PANZOOM_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "-panzoom\"");
 const MAX_PORT_ATTEMPTS: u16 = 10;
@@ -158,7 +158,7 @@ fn spawn_background_scan(state: SharedMarkdownState, dir: PathBuf, recursive: bo
 /// `base_dir`, with forward slashes regardless of platform. For files directly
 /// in `base_dir` this is just the filename, so single-file and non-recursive
 /// directory modes are unaffected.
-fn relative_key(base_dir: &Path, path: &Path) -> String {
+pub(crate) fn relative_key(base_dir: &Path, path: &Path) -> String {
     let rel: PathBuf = match path.strip_prefix(base_dir) {
         Ok(p) => p.to_path_buf(),
         Err(_) => match path.canonicalize() {
@@ -197,7 +197,7 @@ fn html_escape_keep_slash(s: &str) -> String {
     out
 }
 
-fn is_markdown_file(path: &Path) -> bool {
+pub(crate) fn is_markdown_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
@@ -218,6 +218,10 @@ struct MarkdownState {
     /// Whether the initial directory scan is still running, so the UI can say
     /// "scanning" instead of looking like an empty directory.
     scanning: bool,
+    /// Whether the offline-bundle download may collect dependencies that live
+    /// outside `base_dir` (set only for loopback binds, so a networked server
+    /// can't be used to read arbitrary local files).
+    bundle_external: bool,
     change_tx: broadcast::Sender<ServerMessage>,
 }
 
@@ -228,6 +232,7 @@ impl MarkdownState {
         is_directory_mode: bool,
         standalone: bool,
         scanning: bool,
+        bundle_external: bool,
     ) -> Result<Self> {
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
 
@@ -236,7 +241,7 @@ impl MarkdownState {
             let metadata = fs::metadata(&file_path)?;
             let last_modified = metadata.modified()?;
             let content = fs::read_to_string(&file_path)?;
-            let html = Self::markdown_to_html(&content)?;
+            let html = markdown_to_html(&content)?;
 
             let key = relative_key(&base_dir, &file_path);
 
@@ -256,6 +261,7 @@ impl MarkdownState {
             is_directory_mode,
             standalone,
             scanning,
+            bundle_external,
             change_tx,
         })
     }
@@ -282,7 +288,7 @@ impl MarkdownState {
     fn refresh_file(&mut self, filename: &str) -> Result<()> {
         if let Some(tracked) = self.tracked_files.get_mut(filename) {
             let content = fs::read_to_string(&tracked.path)?;
-            tracked.html = Self::markdown_to_html(&content)?;
+            tracked.html = markdown_to_html(&content)?;
             tracked.last_modified = fs::metadata(&tracked.path)?.modified()?;
         }
         Ok(())
@@ -304,23 +310,38 @@ impl MarkdownState {
             TrackedFile {
                 path: file_path,
                 last_modified: metadata.modified()?,
-                html: Self::markdown_to_html(&content)?,
+                html: markdown_to_html(&content)?,
             },
         );
 
         Ok(true)
     }
+}
 
-    fn markdown_to_html(content: &str) -> Result<String> {
-        let mut options = markdown::Options::gfm();
-        options.compile.allow_dangerous_html = true;
-        options.parse.constructs.frontmatter = true;
+/// Renders markdown source to an HTML body fragment (GFM, raw HTML allowed,
+/// frontmatter parsed out). Used by the live server. Non-http link protocols
+/// (e.g. `javascript:`, `file:`) are sanitized out, as in upstream defaults.
+pub(crate) fn markdown_to_html(content: &str) -> Result<String> {
+    markdown_to_html_inner(content, false)
+}
 
-        let html_body = markdown::to_html_with_options(content, &options)
-            .unwrap_or_else(|_| "Error parsing markdown".to_string());
+/// Like [`markdown_to_html`] but keeps non-http link protocols (notably
+/// `file://`) so the offline-bundle builder can discover and collect them.
+/// Scoped to the bundle so the live preview keeps the stricter sanitization.
+pub(crate) fn markdown_to_html_bundle(content: &str) -> Result<String> {
+    markdown_to_html_inner(content, true)
+}
 
-        Ok(html_body)
-    }
+fn markdown_to_html_inner(content: &str, allow_dangerous_protocol: bool) -> Result<String> {
+    let mut options = markdown::Options::gfm();
+    options.compile.allow_dangerous_html = true;
+    options.compile.allow_dangerous_protocol = allow_dangerous_protocol;
+    options.parse.constructs.frontmatter = true;
+
+    let html_body = markdown::to_html_with_options(content, &options)
+        .unwrap_or_else(|_| "Error parsing markdown".to_string());
+
+    Ok(html_body)
 }
 
 /// Handles a markdown file that may have been created or modified.
@@ -420,6 +441,7 @@ fn new_router(
     standalone: bool,
     recursive: bool,
     background_scan: bool,
+    bundle_external: bool,
 ) -> Result<Router> {
     let base_dir = base_dir.canonicalize()?;
 
@@ -429,6 +451,7 @@ fn new_router(
         is_directory_mode,
         standalone,
         background_scan,
+        bundle_external,
     )?));
 
     if background_scan {
@@ -465,6 +488,7 @@ fn new_router(
         .route("/", get(serve_html_root))
         .route("/ws", get(websocket_handler))
         .route("/api/mermaid-error", post(log_mermaid_error))
+        .route("/api/download", get(download_bundle))
         .route("/mermaid.min.js", get(serve_mermaid_js))
         .route("/panzoom.min.js", get(serve_panzoom_js))
         .route("/*filename", get(serve_file))
@@ -511,6 +535,10 @@ pub(crate) async fn serve_markdown(
     let hostname = hostname.as_ref();
 
     let first_file = tracked_files.first().cloned();
+    // Only allow the offline bundle to collect files outside the served
+    // directory on loopback binds; a networked server must not be usable to
+    // read arbitrary local files.
+    let bundle_external = is_loopback_host(hostname);
     let router = new_router(
         base_dir.clone(),
         tracked_files,
@@ -520,6 +548,7 @@ pub(crate) async fn serve_markdown(
         // Directory mode always discovers its files in the background so a large
         // tree doesn't delay the first page; single-file mode has nothing to scan.
         is_directory_mode,
+        bundle_external,
     )?;
 
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
@@ -557,6 +586,16 @@ fn format_host(hostname: &str, port: u16) -> String {
     } else {
         format!("{hostname}:{port}")
     }
+}
+
+/// Whether a bind hostname refers to the local machine only. Unknown hostnames
+/// are treated as non-loopback (conservative).
+fn is_loopback_host(hostname: &str) -> bool {
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Map wildcard bind addresses to loopback so the browser gets a
@@ -745,6 +784,11 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             standalone => state.standalone,
             mermaid_js => mermaid_js,
             panzoom_js => panzoom_js,
+            mermaid_js_src => Value::from_safe_string("/mermaid.min.js".to_string()),
+            panzoom_js_src => Value::from_safe_string("/panzoom.min.js".to_string()),
+            // The download button is a live-server affordance: always shown here
+            // (including under --standalone), never in the generated bundle pages.
+            show_download => true,
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -763,6 +807,11 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             standalone => state.standalone,
             mermaid_js => mermaid_js,
             panzoom_js => panzoom_js,
+            mermaid_js_src => Value::from_safe_string("/mermaid.min.js".to_string()),
+            panzoom_js_src => Value::from_safe_string("/panzoom.min.js".to_string()),
+            // The download button is a live-server affordance: always shown here
+            // (including under --standalone), never in the generated bundle pages.
+            show_download => true,
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -775,6 +824,163 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
     };
 
     (StatusCode::OK, Html(rendered))
+}
+
+/// Renders a full HTML page for the offline bundle from an already-rendered
+/// HTML body. The page references the shared mermaid/panzoom libraries bundled
+/// once at `_assets/` (via `asset_prefix`, the relative path back to the bundle
+/// root, e.g. "" or "../") rather than inlining them, so a bundle with many
+/// diagram pages stays small. There is no navigation sidebar and no download
+/// button, and it works opened directly from `file://`. Returns a best-effort
+/// page even on template error so bundling never aborts.
+pub(crate) fn render_bundle_page(html_body: &str, page_title: &str, asset_prefix: &str) -> String {
+    let env = template_env();
+    let template = match env.get_template(TEMPLATE_NAME) {
+        Ok(t) => t,
+        Err(e) => return format!("Template error: {e}"),
+    };
+
+    let has_mermaid = html_body.contains(r#"class="language-mermaid""#);
+
+    template
+        .render(context! {
+            content => Value::from_safe_string(html_body.to_string()),
+            mermaid_enabled => has_mermaid,
+            show_navigation => false,
+            page_title => page_title,
+            standalone => true,
+            // Empty inline JS forces the template to use the *_src references.
+            mermaid_js => "",
+            panzoom_js => "",
+            mermaid_js_src => Value::from_safe_string(
+                format!("{asset_prefix}{}", crate::bundle::BUNDLE_MERMAID_JS_PATH)
+            ),
+            panzoom_js_src => Value::from_safe_string(
+                format!("{asset_prefix}{}", crate::bundle::BUNDLE_PANZOOM_JS_PATH)
+            ),
+            // No download button inside the bundle's own pages.
+            show_download => false,
+        })
+        .unwrap_or_else(|e| format!("Rendering error: {e}"))
+}
+
+/// Computes the download filename stem: the served directory's name in
+/// directory mode, otherwise the single file's stem. Falls back to "bundle".
+/// Strips characters unsafe for a Content-Disposition header.
+fn bundle_filename(state: &MarkdownState) -> String {
+    let raw = if state.is_directory_mode {
+        state
+            .base_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bundle")
+            .to_string()
+    } else {
+        state
+            .tracked_files
+            .values()
+            .next()
+            .and_then(|t| t.path.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("bundle")
+            .to_string()
+    };
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n' | '/'))
+        .collect();
+    if cleaned.is_empty() {
+        "bundle".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Rejects cross-origin requests. The bundle can contain local file contents,
+/// and permissive CORS would otherwise let a page the user visits read it via
+/// `fetch`. Requests with no `Origin` (same-origin navigation, curl) are
+/// allowed; an `Origin` whose authority differs from `Host` is rejected.
+fn is_same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let origin_authority = origin.split_once("://").map(|(_, a)| a).unwrap_or(origin);
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    origin_authority == host
+}
+
+/// Builds and returns a zip bundle of the served markdown rendered to
+/// self-contained offline HTML plus all recursively-collected local
+/// dependencies. See `crate::bundle`.
+async fn download_bundle(
+    headers: HeaderMap,
+    State(state): State<SharedMarkdownState>,
+) -> axum::response::Response {
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin requests are not allowed",
+        )
+            .into_response();
+    }
+
+    let (base_dir, is_directory_mode, bundle_external, roots, zip_name) = {
+        let state = state.lock().await;
+        let roots: Vec<crate::bundle::RootDoc> = state
+            .tracked_files
+            .values()
+            .map(|tracked| crate::bundle::RootDoc {
+                abs_path: tracked.path.clone(),
+                source: fs::read_to_string(&tracked.path).unwrap_or_default(),
+            })
+            .collect();
+        (
+            state.base_dir.clone(),
+            state.is_directory_mode,
+            state.bundle_external,
+            roots,
+            bundle_filename(&state),
+        )
+    };
+
+    let build = tokio::task::spawn_blocking(move || {
+        crate::bundle::build_zip(
+            &base_dir,
+            &roots,
+            is_directory_mode,
+            bundle_external,
+            render_bundle_page,
+        )
+    })
+    .await;
+
+    match build {
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{zip_name}.zip\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bundle error: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bundle task failed: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
@@ -1276,6 +1482,7 @@ mod tests {
             false,
             false,
             false,
+            true,
         )
         .expect("Failed to create router");
 
@@ -1321,6 +1528,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         )
         .expect("Failed to create router");
 
@@ -1356,7 +1564,7 @@ mod tests {
             .expect("Failed to canonicalize base dir");
         let tracked_files =
             scan_markdown_files(&base_dir, true).expect("Failed to scan markdown files");
-        let router = new_router(base_dir, tracked_files, true, false, true, false)
+        let router = new_router(base_dir, tracked_files, true, false, true, false, true)
             .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
@@ -1387,7 +1595,7 @@ mod tests {
             .canonicalize()
             .expect("Failed to canonicalize base dir");
         // No files are handed over: the server starts empty and finds them itself.
-        let router = new_router(base_dir, Vec::new(), true, false, true, true)
+        let router = new_router(base_dir, Vec::new(), true, false, true, true, false)
             .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
@@ -1427,7 +1635,7 @@ mod tests {
             .path()
             .canonicalize()
             .expect("Failed to canonicalize base dir");
-        let router = new_router(base_dir, Vec::new(), true, false, true, true)
+        let router = new_router(base_dir, Vec::new(), true, false, true, true, false)
             .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
 
@@ -1441,7 +1649,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let base_dir = temp_dir.path().to_path_buf();
 
-        let scanning = MarkdownState::new(base_dir.clone(), Vec::new(), true, false, true)
+        let scanning = MarkdownState::new(base_dir.clone(), Vec::new(), true, false, true, false)
             .expect("Failed to build state");
         let (status, body) = render_empty_page(&scanning);
         assert_eq!(status, StatusCode::OK);
@@ -1451,7 +1659,7 @@ mod tests {
             "the client needs the marker to reload once the first file lands"
         );
 
-        let finished = MarkdownState::new(base_dir, Vec::new(), true, false, false)
+        let finished = MarkdownState::new(base_dir, Vec::new(), true, false, false, false)
             .expect("Failed to build state");
         assert!(render_empty_page(&finished)
             .1
@@ -1582,6 +1790,7 @@ fn main() {
             false,
             false,
             false,
+            true,
         )
         .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
@@ -1595,6 +1804,277 @@ fn main() {
         assert_eq!(img_response.status_code(), 200);
         assert_eq!(img_response.header("content-type"), "image/png");
         assert!(!img_response.as_bytes().is_empty());
+    }
+
+    // A minimal valid 1x1 PNG, shared by the image/bundle tests.
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0x0F, 0x00, 0x00, 0x01, 0x00, 0x01, 0x5C, 0xDD, 0x8D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_download_bundle_directory_mode() {
+        // base_dir with a page that references an image, a linked .md in a
+        // subdir, an external link, and a file:// link to a file OUTSIDE
+        // base_dir; plus a mermaid page.
+        let temp_dir = tempdir().expect("temp dir");
+        let outside_dir = tempdir().expect("outside temp dir");
+
+        let shared = outside_dir.path().join("shared.md");
+        fs::write(&shared, "# Shared external doc").expect("write shared.md");
+        let shared_url = format!(
+            "file://{}",
+            shared.canonicalize().unwrap().to_string_lossy()
+        );
+
+        let home = format!(
+            "# Home\n\n![pic](img/a.png)\n\n[guide](sub/other.md)\n\n\
+             [site](https://example.com)\n\n[outside]({shared_url})\n"
+        );
+        fs::write(temp_dir.path().join("home.md"), home).expect("write home.md");
+
+        fs::create_dir_all(temp_dir.path().join("img")).unwrap();
+        fs::write(temp_dir.path().join("img/a.png"), tiny_png()).expect("write png");
+
+        fs::create_dir_all(temp_dir.path().join("sub")).unwrap();
+        fs::write(
+            temp_dir.path().join("sub/other.md"),
+            "# Other\n\nback [home](../home.md)\n",
+        )
+        .expect("write other.md");
+
+        fs::write(
+            temp_dir.path().join("diagram.md"),
+            "# Diagram\n\n```mermaid\ngraph TD\n  A --> B\n```\n",
+        )
+        .expect("write diagram.md");
+
+        let base_dir = temp_dir.path().to_path_buf();
+        let tracked = scan_markdown_files(&base_dir, true).expect("scan");
+        let router = new_router(base_dir, tracked, true, false, true, false, true).expect("router");
+        let server = TestServer::new(router).expect("test server");
+
+        let response = server.get("/api/download").await;
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("content-type"), "application/zip");
+        assert!(response
+            .header("content-disposition")
+            .to_str()
+            .unwrap()
+            .contains("attachment; filename="));
+
+        let bytes = response.as_bytes().to_vec();
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid zip archive");
+
+        let mut names = Vec::new();
+        let mut contents: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            let name = file.name().to_string();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut buf).unwrap();
+            contents.insert(name.clone(), buf);
+            names.push(name);
+        }
+
+        // Markdown rendered to HTML, nested path preserved.
+        assert!(names.contains(&"home.html".to_string()), "names: {names:?}");
+        assert!(
+            names.contains(&"sub/other.html".to_string()),
+            "names: {names:?}"
+        );
+        assert!(
+            names.contains(&"diagram.html".to_string()),
+            "names: {names:?}"
+        );
+        // Asset bundled byte-exact.
+        assert_eq!(
+            contents.get("img/a.png").map(|b| b.as_slice()),
+            Some(tiny_png().as_slice())
+        );
+        // Outside-dir dep pulled into _external/, rendered to .html.
+        let external = names
+            .iter()
+            .find(|n| n.starts_with("_external/") && n.ends_with("shared.html"));
+        assert!(
+            external.is_some(),
+            "expected _external shared.html, names: {names:?}"
+        );
+        // Directory index generated (no tracked index.md here).
+        assert!(
+            names.contains(&"index.html".to_string()),
+            "names: {names:?}"
+        );
+
+        // Links rewritten in home.html.
+        let home_html = String::from_utf8(contents["home.html"].clone()).unwrap();
+        assert!(home_html.contains("src=\"img/a.png\""), "{home_html}");
+        assert!(home_html.contains("href=\"sub/other.html\""), "{home_html}");
+        assert!(
+            home_html.contains(&format!("href=\"{}\"", external.unwrap())),
+            "outside link should point at bundled _external path"
+        );
+        // External link untouched.
+        assert!(
+            home_html.contains("href=\"https://example.com\""),
+            "{home_html}"
+        );
+        // Bundle pages don't carry a (dead) download button.
+        assert!(
+            !home_html.contains("/api/download"),
+            "bundle pages should not include the download button"
+        );
+
+        // Nested page link back to ../home.md rewritten to ../home.html.
+        let other_html = String::from_utf8(contents["sub/other.html"].clone()).unwrap();
+        assert!(other_html.contains("href=\"../home.html\""), "{other_html}");
+
+        // Mermaid page references the shared library (not the server path, not
+        // inlined), and the library is bundled once under _assets/.
+        let diagram_html = String::from_utf8(contents["diagram.html"].clone()).unwrap();
+        assert!(!diagram_html.contains("src=\"/mermaid.min.js\""));
+        assert!(
+            diagram_html.contains("src=\"_assets/mermaid.min.js\""),
+            "diagram page should reference the shared mermaid lib"
+        );
+        // The full library is NOT inlined into the page.
+        assert!(
+            !diagram_html.contains(&MERMAID_JS[..120]),
+            "mermaid JS must not be inlined into the page"
+        );
+        assert!(
+            diagram_html.len() < 100_000,
+            "page should be small without inlined JS"
+        );
+        // Shared libraries bundled once, byte-exact.
+        assert_eq!(
+            contents.get("_assets/mermaid.min.js").map(|b| b.as_slice()),
+            Some(MERMAID_JS.as_bytes())
+        );
+        assert!(
+            names.contains(&"_assets/panzoom.min.js".to_string()),
+            "names: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_rejects_cross_origin() {
+        let temp_dir = tempdir().expect("temp dir");
+        let md_path = temp_dir.path().join("notes.md");
+        fs::write(&md_path, "# Notes").expect("write");
+        let base_dir = temp_dir.path().to_path_buf();
+        let router =
+            new_router(base_dir, vec![md_path], false, false, false, false, true).expect("router");
+        let server = TestServer::new(router).expect("test server");
+
+        // Same-origin (no Origin header) is allowed.
+        assert_eq!(server.get("/api/download").await.status_code(), 200);
+
+        // A cross-origin Origin is rejected (CSRF/CORS read protection).
+        let resp = server
+            .get("/api/download")
+            .add_header(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_static("http://evil.example"),
+            )
+            .await;
+        assert_eq!(resp.status_code(), 403);
+    }
+
+    #[tokio::test]
+    async fn test_download_bundle_excludes_external_when_not_loopback() {
+        let temp_dir = tempdir().expect("temp dir");
+        let outside_dir = tempdir().expect("outside temp dir");
+        let shared = outside_dir.path().join("shared.md");
+        fs::write(&shared, "# Shared").expect("write shared.md");
+        let shared_url = format!(
+            "file://{}",
+            shared.canonicalize().unwrap().to_string_lossy()
+        );
+
+        fs::write(temp_dir.path().join("img.png"), tiny_png()).unwrap();
+        let home = format!("# Home\n\n![pic](img.png)\n\n[outside]({shared_url})\n");
+        fs::write(temp_dir.path().join("home.md"), &home).expect("write home.md");
+
+        let base_dir = temp_dir.path().to_path_buf();
+        let tracked = scan_markdown_files(&base_dir, true).expect("scan");
+        // bundle_external = false (simulating a non-loopback bind).
+        let router =
+            new_router(base_dir, tracked, true, false, true, false, false).expect("router");
+        let server = TestServer::new(router).expect("test server");
+
+        let bytes = server.get("/api/download").await.as_bytes().to_vec();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut names = Vec::new();
+        let mut home_html = String::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            if name == "home.html" {
+                std::io::Read::read_to_string(&mut f, &mut home_html).unwrap();
+            }
+            names.push(name);
+        }
+
+        // In-base dependency still bundled...
+        assert!(names.contains(&"img.png".to_string()), "names: {names:?}");
+        // ...but nothing outside base_dir was collected.
+        assert!(
+            !names.iter().any(|n| n.starts_with("_external/")),
+            "no external files expected, names: {names:?}"
+        );
+        // The outside link is left as-authored (not rewritten).
+        assert!(
+            home_html.contains("file://"),
+            "outside link should be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_bundle_single_file_mode() {
+        let temp_dir = tempdir().expect("temp dir");
+        let md_path = temp_dir.path().join("notes.md");
+        fs::write(&md_path, "# Notes\n\n![pic](a.png)\n").expect("write notes.md");
+        fs::write(temp_dir.path().join("a.png"), tiny_png()).expect("write png");
+
+        let base_dir = temp_dir.path().to_path_buf();
+        let router =
+            new_router(base_dir, vec![md_path], false, false, false, false, true).expect("router");
+        let server = TestServer::new(router).expect("test server");
+
+        let response = server.get("/api/download").await;
+        assert_eq!(response.status_code(), 200);
+        // Filename derives from the file stem.
+        assert!(response
+            .header("content-disposition")
+            .to_str()
+            .unwrap()
+            .contains("filename=\"notes.zip\""));
+
+        let bytes = response.as_bytes().to_vec();
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid zip archive");
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+
+        assert!(
+            names.contains(&"notes.html".to_string()),
+            "names: {names:?}"
+        );
+        assert!(names.contains(&"a.png".to_string()), "names: {names:?}");
+        // No generated index in single-file mode.
+        assert!(
+            !names.contains(&"index.html".to_string()),
+            "names: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -1618,6 +2098,7 @@ fn main() {
             false,
             false,
             false,
+            true,
         )
         .expect("Failed to create router");
         let server = TestServer::new(router).expect("Failed to create test server");
@@ -1893,7 +2374,16 @@ classDiagram
             .canonicalize()
             .unwrap_or_else(|_| temp_file.path().to_path_buf());
         let base_dir = canonical_path.parent().unwrap().to_path_buf();
-        let router = new_router(base_dir, vec![canonical_path], false, true, false, false).unwrap();
+        let router = new_router(
+            base_dir,
+            vec![canonical_path],
+            false,
+            true,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
         let server = TestServer::new(router).unwrap();
 
         let body = server.get("/").await.text();
@@ -1913,6 +2403,12 @@ classDiagram
         assert!(
             body.contains(PANZOOM_JS),
             "panzoom.min.js content should be inlined in the HTML body"
+        );
+        // The live server still offers the download button under --standalone;
+        // it's a server affordance, not gated by the standalone flag.
+        assert!(
+            body.contains("/api/download"),
+            "download button should be present even in standalone mode"
         );
     }
 
@@ -1939,7 +2435,16 @@ classDiagram
             .canonicalize()
             .unwrap_or_else(|_| temp_file.path().to_path_buf());
         let base_dir = canonical_path.parent().unwrap().to_path_buf();
-        let router = new_router(base_dir, vec![canonical_path], false, true, false, false).unwrap();
+        let router = new_router(
+            base_dir,
+            vec![canonical_path],
+            false,
+            true,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
         let server = TestServer::new(router).unwrap();
 
         let body = server.get("/").await.text();

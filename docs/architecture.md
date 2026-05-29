@@ -133,6 +133,7 @@ Single unified router handles both modes:
 - `GET /*path.<ext>` → Images from the base directory (including subdirectories)
 - `GET /ws` → WebSocket connection
 - `GET /mermaid.min.js` → Bundled Mermaid library
+- `GET /api/download` → Offline bundle zip (see below)
 
 Tracked files are keyed by their base-directory-relative path, so the wildcard
 `*path` route can address files in subdirectories. Directory traversal is
@@ -156,6 +157,30 @@ Template variables:
 - `files`: List of tracked files (directory mode)
 - `current_file`: Active file name (directory mode)
 - `awaiting_files`: Marks the placeholder page shown before any file is indexed
+
+### Offline bundle (`src/bundle.rs`)
+
+`GET /api/download` produces a self-contained `.zip` (built in a `spawn_blocking`
+task). Each tracked markdown file is rendered to an offline page via
+`render_bundle_page`; pages reference a single shared copy of the mermaid/panzoom
+libraries written under `_assets/` (relative `../` paths per page depth) rather
+than inlining them, so many-diagram bundles stay small.
+A BFS walk over the rendered HTML's `href`/`src` attributes discovers local
+dependencies, classifies them (external URLs left untouched; relative/absolute/
+`file://` paths bundled), resolves them to canonical paths, and follows linked
+`.md` files transitively (visited-set dedup; `MAX_FILES`/`MAX_TOTAL_BYTES` caps).
+Files inside `base_dir` mirror their relative path (markdown → `.html`); files
+outside go under `_external/<sanitized-absolute-path>`. Links are then rewritten
+in each page's HTML to bundled relative paths. Directory mode also emits a
+generated `index.html`. Collecting dependencies outside `base_dir` is allowed
+only on loopback binds (`127.0.0.1`/`::1`/`localhost`); when bound to a network
+interface (`--hostname 0.0.0.0`) the walk stays within `base_dir`, so a remote
+client can't pull arbitrary local files. The endpoint also rejects cross-origin
+requests (an `Origin` not matching `Host`) to stop a visited web page from
+reading the bundle via the permissive CORS layer. `allow_dangerous_protocol`
+(needed so `file://` links survive rendering for collection) is scoped to the
+bundle renderer; the live preview keeps the stricter sanitization. Uses the
+[`zip`](https://docs.rs/zip) crate (pure-Rust `miniz_oxide` DEFLATE).
 
 ## Design Decisions
 
