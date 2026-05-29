@@ -92,6 +92,19 @@ Use Mermaid diagrams when they improve clarity over plain text:
 Prefer Mermaid over ASCII art when the diagram has more than a few
 elements or shows relationships and flow.
 
+## GitHub alerts
+
+Callout boxes render from GitHub's alert syntax — a blockquote whose
+first line is one of `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`,
+or `[!CAUTION]`:
+
+```
+> [!WARNING]
+> This step is destructive.
+```
+
+Use them to highlight caveats, tips, and warnings in plans and docs.
+
 Diagrams render in the browser, but parse errors stream back to the
 terminal running mdserve (the background task output), printed with the
 failing diagram's source. After adding or editing a diagram, check that

@@ -341,10 +341,102 @@ fn markdown_to_html_inner(content: &str, allow_dangerous_protocol: bool) -> Resu
     let html_body = markdown::to_html_with_options(content, &options)
         .unwrap_or_else(|_| "Error parsing markdown".to_string());
 
+    let html_body = render_github_alerts(&html_body);
     Ok(add_heading_ids(&html_body))
 }
 
-/// Link (chain) octicon shown on heading hover, linking to the heading's anchor.
+/// Alert kinds GitHub recognizes: `(marker, title, emoji)`.
+const ALERT_KINDS: &[(&str, &str, &str)] = &[
+    ("note", "Note", "ℹ️"),
+    ("tip", "Tip", "💡"),
+    ("important", "Important", "❗"),
+    ("warning", "Warning", "⚠️"),
+    ("caution", "Caution", "🛑"),
+];
+
+/// Converts GitHub alert blockquotes — a blockquote whose first line is
+/// `[!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` — into
+/// styled callout boxes. Other blockquotes are left untouched.
+fn render_github_alerts(html: &str) -> String {
+    let (open, close) = ("<blockquote>", "</blockquote>");
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        let body_start = start + open.len();
+        let Some(end_rel) = matching_blockquote_end(&rest[body_start..]) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &rest[body_start..body_start + end_rel];
+        match alert_from_blockquote(inner) {
+            Some(rendered) => out.push_str(&rendered),
+            None => {
+                out.push_str(open);
+                out.push_str(inner);
+                out.push_str(close);
+            }
+        }
+        rest = &rest[body_start + end_rel + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Finds the byte offset of the `</blockquote>` that closes the blockquote whose
+/// inner content starts at the beginning of `s` (handling nested blockquotes).
+fn matching_blockquote_end(s: &str) -> Option<usize> {
+    let (open, close) = ("<blockquote>", "</blockquote>");
+    let mut depth = 0usize;
+    let mut i = 0;
+    loop {
+        let next_open = s[i..].find(open).map(|r| i + r);
+        let next_close = s[i..].find(close).map(|r| i + r);
+        match (next_open, next_close) {
+            (Some(o), Some(c)) if o < c => {
+                depth += 1;
+                i = o + open.len();
+            }
+            (_, Some(c)) => {
+                if depth == 0 {
+                    return Some(c);
+                }
+                depth -= 1;
+                i = c + close.len();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// If `inner` (a blockquote's contents) begins with a recognized `[!TYPE]`
+/// marker alone on the first line, returns the alert `<div>` markup.
+fn alert_from_blockquote(inner: &str) -> Option<String> {
+    let after_p = inner.trim_start().strip_prefix("<p>")?;
+    let after_bracket = after_p.strip_prefix("[!")?;
+    let close = after_bracket.find(']')?;
+    let kind = after_bracket[..close].to_ascii_lowercase();
+    let (_, title, icon) = *ALERT_KINDS.iter().find(|(k, _, _)| *k == kind)?;
+
+    // The marker must be alone on the first line: what follows `]` is either a
+    // soft break before the body, or the paragraph close (title-only alert).
+    let after_marker = &after_bracket[close + 1..];
+    let body = if let Some(rest) = after_marker.strip_prefix('\n') {
+        format!("<p>{rest}")
+    } else if let Some(rest) = after_marker.strip_prefix("</p>") {
+        rest.to_string()
+    } else {
+        return None;
+    };
+
+    Some(format!(
+        "<div class=\"markdown-alert markdown-alert-{kind}\">\n\
+         <p class=\"markdown-alert-title\">{icon} {title}</p>\n{body}\n</div>"
+    ))
+}
+
+// Link (chain) octicon shown on heading hover, linking to the heading's anchor.
 const HEADING_ANCHOR_ICON: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 2 2 0 0 0 2.83 0l2.5-2.5a2 2 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a2 2 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 2 2 0 0 0-2.83 0l-2.5 2.5a2 2 0 0 0 0 2.83Z"></path></svg>"##;
 
 /// Adds GitHub-style slug `id` attributes to `<h1>`..`<h6>` tags so in-page
@@ -1366,6 +1458,39 @@ mod tests {
             html.contains(r##"<h1 id="intro"><a class="heading-anchor" href="#intro""##),
             "{html}"
         );
+    }
+
+    #[test]
+    fn test_github_alerts_render() {
+        let md = "> [!NOTE]\n> Heads up.\n\n> [!WARNING]\n> One.\n>\n> Two.\n";
+        let html = markdown_to_html(md).unwrap();
+        assert!(
+            html.contains(r#"<div class="markdown-alert markdown-alert-note">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"markdown-alert-title">ℹ️ Note</p>"#),
+            "{html}"
+        );
+        assert!(html.contains("Heads up."), "{html}");
+        // Multi-paragraph warning keeps both paragraphs.
+        assert!(
+            html.contains(r#"markdown-alert-warning"#)
+                && html.contains("One.")
+                && html.contains("Two."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn test_non_alert_blockquotes_unchanged() {
+        // A plain quote and an unknown marker stay as blockquotes.
+        let html = markdown_to_html("> just a quote\n\n> [!BOGUS]\n> nope\n").unwrap();
+        assert_eq!(html.matches("<blockquote>").count(), 2, "{html}");
+        assert!(!html.contains("markdown-alert"), "{html}");
+        // An inline marker (not alone on the line) is not an alert.
+        let inline = markdown_to_html("> [!NOTE] with trailing text\n").unwrap();
+        assert!(!inline.contains("markdown-alert"), "{inline}");
     }
 
     #[test]
