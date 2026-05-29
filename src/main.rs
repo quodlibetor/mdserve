@@ -7,10 +7,19 @@ mod bundle;
 
 use app::serve_markdown;
 
+/// Version string for `--version`: crate version plus the git commit the binary
+/// was built from (`MDSERVE_GIT_COMMIT` is set by build.rs).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("MDSERVE_GIT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(name = "mdserve")]
 #[command(about = "A simple HTTP server for markdown preview")]
-#[command(version)]
+#[command(version = VERSION)]
 struct Args {
     /// Path to markdown file or directory to serve
     path: PathBuf,
@@ -45,6 +54,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    println!("mdserve {VERSION}");
     let recursive = !args.no_recursive;
     let absolute_path = args.path.canonicalize().unwrap_or(args.path);
 
