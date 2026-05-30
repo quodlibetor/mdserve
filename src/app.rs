@@ -27,7 +27,7 @@ use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGener
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, Mutex},
 };
 use tower_http::cors::CorsLayer;
@@ -882,6 +882,29 @@ fn new_router(
     Ok(router)
 }
 
+/// Whether something is already listening on `hostname:port`.
+///
+/// A successful `bind()` is not a reliable "port is free" check: tokio sets
+/// `SO_REUSEADDR`, which on macOS/BSD lets a specific address (e.g.
+/// `127.0.0.1`) bind over an already-listening wildcard socket (e.g. another
+/// dev server on `[::]:3000`) without an `AddrInUse` error. So we additionally
+/// probe with a connection — if anything accepts it, the port is taken. Only a
+/// live listener answers; sockets lingering in `TIME_WAIT` do not, so this
+/// won't spuriously bump the port on a quick restart of mdserve itself.
+async fn port_in_use(hostname: &str, port: u16) -> bool {
+    // A connect to a live loopback listener (or an instant refusal for a free
+    // port) resolves in ~100us; the timeout is only a guard against a connect
+    // hanging on a non-loopback hostname behind a SYN-dropping firewall.
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            TcpStream::connect((hostname, port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)> {
     let mut last_err = None;
     for offset in 0..MAX_PORT_ATTEMPTS {
@@ -889,6 +912,9 @@ async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)
             Some(p) => p,
             None => break,
         };
+        if port_in_use(hostname, try_port).await {
+            continue;
+        }
         match TcpListener::bind((hostname, try_port)).await {
             Ok(listener) => return Ok((listener, try_port)),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => last_err = Some(e),
@@ -897,7 +923,7 @@ async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)
     }
     Err(last_err
         .map(|e| anyhow::anyhow!(e))
-        .unwrap_or_else(|| anyhow::anyhow!("no valid port in range"))
+        .unwrap_or_else(|| anyhow::anyhow!("all candidate ports are already in use"))
         .context(format!(
             "could not bind to ports {}--{}",
             port,
@@ -938,7 +964,7 @@ pub(crate) async fn serve_markdown(
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
 
     if actual_port != port {
-        println!("⚠ Port {port} in use, using {actual_port} instead");
+        println!("⚠️  Port {port} in use, using {actual_port} instead");
     }
 
     let listen_addr = format_host(hostname, actual_port);
@@ -1932,6 +1958,25 @@ mod tests {
 
         drop(retry_listener);
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_port_in_use_detects_live_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+
+        // A live listener must be detected as in-use, even though tokio's
+        // SO_REUSEADDR can let bind() of a specific addr-over-wildcard succeed.
+        assert!(port_in_use("127.0.0.1", busy_port).await);
+
+        drop(listener);
+
+        // Once the listener is gone the port reads as free.
+        let free_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!port_in_use("127.0.0.1", free_port).await);
     }
 
     use axum_test::TestServer;
