@@ -143,7 +143,7 @@ within the base directory.
 
 ### Rendering
 
-Markdown is rendered to HTML with [markdown-rs](https://github.com/wooorm/markdown-rs), then post-processed in `src/app.rs`: rendered headings get GitHub-style slug `id` attributes plus a clickable hover anchor link (`add_heading_ids`) so in-page `#anchor` links resolve; GitHub alert blockquotes (`> [!NOTE]` etc.) become styled callouts (`render_github_alerts`); and fenced code blocks are syntax-highlighted server-side with [syntect](https://github.com/trishume/syntect) (`highlight_code_blocks`), using [two-face](https://github.com/CosmicHorrorDev/two-face)'s ~250-language syntax set (bat's), emitting `syn-`-prefixed class spans with theme-scoped CSS (`highlight_css`) so colors follow the page theme. All of this applies to both the live preview and the offline bundle (no client-side JS).
+Markdown is rendered to HTML with [markdown-rs](https://github.com/wooorm/markdown-rs), then post-processed in `src/app.rs`: rendered headings get GitHub-style slug `id` attributes plus a clickable hover anchor link (`add_heading_ids`) so in-page `#anchor` links resolve; GitHub alert blockquotes (`> [!NOTE]` etc.) become styled callouts (`render_github_alerts`); and fenced code blocks are syntax-highlighted server-side with [syntect](https://github.com/trishume/syntect) (`highlight_code_blocks`), using [two-face](https://github.com/CosmicHorrorDev/two-face)'s ~250-language syntax set (bat's), emitting `syn-`-prefixed class spans with theme-scoped CSS (`highlight_css`) so colors follow the page theme. All of this applies to both the live preview and the offline bundle (no client-side JS). Each page also embeds the raw markdown source as a syntax-highlighted (as markdown) code block (`render_raw_markdown`, cached per file like the rendered HTML); the 📄 toggle swaps the visible view client-side and remembers the choice in `localStorage`.
 
 The page is assembled with [MiniJinja](https://github.com/mitsuhiko/minijinja) (Jinja2 template syntax) with templates embedded at compile time via [minijinja_embed](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-embed).
 
@@ -164,9 +164,11 @@ Template variables:
 
 `GET /api/download` produces a self-contained `.zip` (built in a `spawn_blocking`
 task). Each tracked markdown file is rendered to an offline page via
-`render_bundle_page`; pages reference a single shared copy of the mermaid/panzoom
-libraries written under `_assets/` (relative `../` paths per page depth) rather
-than inlining them, so many-diagram bundles stay small.
+`render_bundle_page`, and its raw `.md` source is bundled alongside the rendered
+`.html` (at the same path with the original extension restored); pages reference
+a single shared copy of the mermaid/panzoom libraries written under `_assets/`
+(relative `../` paths per page depth) rather than inlining them, so many-diagram
+bundles stay small.
 A BFS walk over the rendered HTML's `href`/`src` attributes discovers local
 dependencies, classifies them (external URLs left untouched; relative/absolute/
 `file://` paths bundled), resolves them to canonical paths, and follows linked
@@ -196,7 +198,7 @@ bundle renderer; the live preview keeps the stricter sanitization. Uses the
 
 **Scan in the background**: Serving starts immediately and the file list streams to clients, rather than making startup wait on a full walk. The cost is that a file can 404 briefly before the scan reaches it.
 
-**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript stays small (theme management, reload execution, sidebar list updates).
+**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript stays small (theme management, reload execution, sidebar list updates, rendered/source view toggle).
 
 ## Constraints
 

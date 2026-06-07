@@ -29,6 +29,20 @@
                     });
                 }
             }
+
+            // Apply raw-source view state before first paint (same pattern as
+            // the sidebar) so the chosen view doesn't flash on load.
+            const showRaw = localStorage.getItem('show-raw') === 'true';
+            if (showRaw) {
+                document.documentElement.classList.add('show-raw');
+                if (document.body) {
+                    document.body.classList.add('show-raw');
+                } else {
+                    document.addEventListener('DOMContentLoaded', function() {
+                        document.body.classList.add('show-raw');
+                    });
+                }
+            }
         })();
     </script>
 
@@ -208,7 +222,8 @@
         }
 
         /* Main Content Area */
-        #content {
+        #content,
+        #raw-content {
             /* Center content in remaining space while avoiding sidebar overlap */
             margin-left: max(var(--sidebar-width), calc((100vw - var(--content-max-width)) / 2));
             margin-right: auto;
@@ -218,7 +233,8 @@
             transition: margin-left var(--transition-speed) var(--transition-timing);
         }
 
-        body.sidebar-collapsed #content {
+        body.sidebar-collapsed #content,
+        body.sidebar-collapsed #raw-content {
             margin-left: max(var(--sidebar-collapsed-width), calc((100vw - var(--content-max-width)) / 2));
         }
 
@@ -285,9 +301,35 @@
             outline: none;
         }
 
-        /* Sits just left of the theme toggle */
-        .download-toggle {
+        /* Control buttons sit in a row at the top-right, left of the theme
+           toggle (right: 20px). */
+        .raw-toggle {
             right: 64px;
+        }
+
+        .download-toggle {
+            right: 108px;
+        }
+
+        /* Raw markdown source view: hidden until toggled on. */
+        #raw-content {
+            display: none;
+        }
+
+        body.show-raw #content {
+            display: none;
+        }
+
+        body.show-raw #raw-content {
+            display: block;
+        }
+
+        /* The raw view is a single code block; let it fill the content column
+           and scroll horizontally instead of forcing the page wider. */
+        #raw-content pre {
+            margin: 0;
+            white-space: pre;
+            overflow-x: auto;
         }
 
         .theme-modal {
@@ -707,6 +749,27 @@
             }
         }
 
+        // Raw markdown source view toggle
+        function updateRawToggle(showRaw) {
+            const btn = document.getElementById('rawToggle');
+            if (!btn) return;
+            btn.textContent = showRaw ? '👁️' : '📄';
+            btn.title = showRaw ? 'View rendered output' : 'View markdown source';
+        }
+
+        function toggleRawView() {
+            const showRaw = !document.body.classList.contains('show-raw');
+            document.body.classList.toggle('show-raw', showRaw);
+            localStorage.setItem('show-raw', showRaw ? 'true' : 'false');
+            updateRawToggle(showRaw);
+        }
+
+        function initRawView() {
+            const showRaw = localStorage.getItem('show-raw') === 'true';
+            document.body.classList.toggle('show-raw', showRaw);
+            updateRawToggle(showRaw);
+        }
+
         // Mermaid theme management
         function getMermaidTheme() {
             const currentTheme = document.documentElement.getAttribute('data-theme');
@@ -968,6 +1031,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             initTheme();
             initSidebar();
+            initRawView();
             initMermaid();
             setupLiveReload();
 
@@ -1029,10 +1093,19 @@
 <button class="theme-toggle download-toggle" onclick="window.location.href='/api/download'"
         title="Download offline bundle (zip)" aria-label="Download offline bundle">⬇️</button>
 {% endif %}
+{% if show_raw %}
+<button class="theme-toggle raw-toggle" id="rawToggle" onclick="toggleRawView()"
+        title="View markdown source" aria-label="Toggle markdown source view">📄</button>
+{% endif %}
 <button class="theme-toggle" onclick="openThemeModal()">🎨</button>
 <div id="content">
 {{ content }}
 </div>
+{% if show_raw %}
+<div id="raw-content">
+{{ raw_content }}
+</div>
+{% endif %}
 
 <div class="diagram-modal" id="diagramModal" role="dialog" aria-modal="true" aria-label="Expanded diagram">
     <button type="button" class="diagram-modal-close" id="diagramModalClose" aria-label="Close diagram">

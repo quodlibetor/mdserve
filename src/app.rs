@@ -212,6 +212,9 @@ struct TrackedFile {
     path: PathBuf,
     last_modified: SystemTime,
     html: String,
+    /// The raw markdown source rendered as a syntax-highlighted code block, for
+    /// the page's "view source" toggle. Pre-rendered so serving stays in-memory.
+    raw_html: String,
 }
 
 struct MarkdownState {
@@ -246,6 +249,7 @@ impl MarkdownState {
             let last_modified = metadata.modified()?;
             let content = fs::read_to_string(&file_path)?;
             let html = markdown_to_html(&content)?;
+            let raw_html = render_raw_markdown(&content);
 
             let key = relative_key(&base_dir, &file_path);
 
@@ -255,6 +259,7 @@ impl MarkdownState {
                     path: file_path,
                     last_modified,
                     html,
+                    raw_html,
                 },
             );
         }
@@ -293,6 +298,7 @@ impl MarkdownState {
         if let Some(tracked) = self.tracked_files.get_mut(filename) {
             let content = fs::read_to_string(&tracked.path)?;
             tracked.html = markdown_to_html(&content)?;
+            tracked.raw_html = render_raw_markdown(&content);
             tracked.last_modified = fs::metadata(&tracked.path)?.modified()?;
         }
         Ok(())
@@ -315,6 +321,7 @@ impl MarkdownState {
                 path: file_path,
                 last_modified: metadata.modified()?,
                 html: markdown_to_html(&content)?,
+                raw_html: render_raw_markdown(&content),
             },
         );
 
@@ -519,6 +526,25 @@ fn decode_code_entities(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+/// Renders raw markdown `source` as a syntax-highlighted code block for the
+/// page's "view source" toggle. The source is HTML-escaped, then highlighted as
+/// markdown; if the markdown syntax or the highlighter is unavailable it falls
+/// back to the plain (still escaped) block. Always wrapped in
+/// `<pre><code class="language-markdown">` so it inherits the page's code
+/// styling and the syntax-highlight CSS.
+pub(crate) fn render_raw_markdown(source: &str) -> String {
+    let escaped = escape_html_text(source);
+    let body = highlight_one("markdown", &escaped).unwrap_or(escaped);
+    format!("<pre><code class=\"language-markdown\">{body}</code></pre>")
+}
+
+/// Minimal text-node HTML escaping for embedding raw source inside a code block.
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Alert kinds GitHub recognizes: `(marker, title, emoji)`.
@@ -1141,16 +1167,23 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
         }
     };
 
-    let (content, has_mermaid, highlight_css_value) =
+    let (content, raw_content, has_mermaid, highlight_css_value) =
         if let Some(tracked) = state.tracked_files.get(current_file) {
             let html = &tracked.html;
             let mermaid = html.contains(r#"class="language-mermaid""#);
-            let css = if has_highlighting(html) {
+            // The raw-source view is highlighted markdown, so the highlight CSS
+            // is needed whenever either view carries highlighted code.
+            let css = if has_highlighting(html) || has_highlighting(&tracked.raw_html) {
                 Value::from_safe_string(highlight_css().to_string())
             } else {
                 Value::from("")
             };
-            (Value::from_safe_string(html.clone()), mermaid, css)
+            (
+                Value::from_safe_string(html.clone()),
+                Value::from_safe_string(tracked.raw_html.clone()),
+                mermaid,
+                css,
+            )
         } else {
             return (StatusCode::NOT_FOUND, Html("File not found".to_string()));
         };
@@ -1192,6 +1225,8 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
 
         match template.render(context! {
             content => content,
+            raw_content => raw_content,
+            show_raw => true,
             mermaid_enabled => has_mermaid,
             show_navigation => true,
             files => files,
@@ -1218,6 +1253,8 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
     } else {
         match template.render(context! {
             content => content,
+            raw_content => raw_content,
+            show_raw => true,
             mermaid_enabled => has_mermaid,
             show_navigation => false,
             page_title => page_title,
@@ -1251,15 +1288,29 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
 /// diagram pages stays small. There is no navigation sidebar and no download
 /// button, and it works opened directly from `file://`. Returns a best-effort
 /// page even on template error so bundling never aborts.
-pub(crate) fn render_bundle_page(html_body: &str, page_title: &str, asset_prefix: &str) -> String {
+pub(crate) fn render_bundle_page(
+    html_body: &str,
+    page_title: &str,
+    asset_prefix: &str,
+    raw_source: &str,
+) -> String {
     let env = template_env();
     let template = match env.get_template(TEMPLATE_NAME) {
         Ok(t) => t,
         Err(e) => return format!("Template error: {e}"),
     };
 
+    // The generated directory index has no markdown source, so it gets no
+    // raw-source toggle.
+    let show_raw = !raw_source.is_empty();
+    let raw_html = if show_raw {
+        render_raw_markdown(raw_source)
+    } else {
+        String::new()
+    };
+
     let has_mermaid = html_body.contains(r#"class="language-mermaid""#);
-    let highlight_css_value = if has_highlighting(html_body) {
+    let highlight_css_value = if has_highlighting(html_body) || has_highlighting(&raw_html) {
         Value::from_safe_string(highlight_css().to_string())
     } else {
         Value::from("")
@@ -1268,6 +1319,8 @@ pub(crate) fn render_bundle_page(html_body: &str, page_title: &str, asset_prefix
     template
         .render(context! {
             content => Value::from_safe_string(html_body.to_string()),
+            raw_content => Value::from_safe_string(raw_html),
+            show_raw => show_raw,
             mermaid_enabled => has_mermaid,
             show_navigation => false,
             page_title => page_title,
@@ -2039,6 +2092,14 @@ mod tests {
         create_test_server_impl(content, false)
     }
 
+    /// The rendered-output region of a page, excluding the raw markdown source
+    /// view (`#raw-content`). Use this for assertions that the raw source isn't
+    /// leaked into the *rendered* HTML — the source legitimately appears in the
+    /// (hidden) raw view.
+    fn rendered_region(body: &str) -> &str {
+        body.split("<div id=\"raw-content\">").next().unwrap_or(body)
+    }
+
     async fn create_test_server_with_http(content: &str) -> (TestServer, NamedTempFile) {
         create_test_server_impl(content, true)
     }
@@ -2439,6 +2500,21 @@ fn main() {
             contents.get("img/a.png").map(|b| b.as_slice()),
             Some(tiny_png().as_slice())
         );
+        // Raw markdown source bundled alongside each rendered page, byte-exact.
+        assert!(names.contains(&"home.md".to_string()), "names: {names:?}");
+        assert!(
+            names.contains(&"sub/other.md".to_string()),
+            "names: {names:?}"
+        );
+        let home_md = String::from_utf8(contents["home.md"].clone()).unwrap();
+        assert!(
+            home_md.starts_with("# Home"),
+            "home.md should be the raw source, got: {home_md}"
+        );
+        assert!(
+            home_md.contains("![pic](img/a.png)"),
+            "raw source must be unmodified markdown, got: {home_md}"
+        );
         // Outside-dir dep pulled into _external/, rendered to .html.
         let external = names
             .iter()
@@ -2470,6 +2546,17 @@ fn main() {
         assert!(
             !home_html.contains("/api/download"),
             "bundle pages should not include the download button"
+        );
+        // Bundle pages carry the raw-source view and its toggle.
+        assert!(
+            home_html.contains("id=\"raw-content\"") && home_html.contains("id=\"rawToggle\""),
+            "bundle pages should include the raw-source view toggle"
+        );
+        // The generated index has no source, so no raw-view toggle.
+        let index_html = String::from_utf8(contents["index.html"].clone()).unwrap();
+        assert!(
+            !index_html.contains("id=\"rawToggle\""),
+            "generated index should not have a raw-source toggle"
         );
 
         // Nested page link back to ../home.md rewritten to ../home.html.
@@ -2668,12 +2755,53 @@ Regular **markdown** still works.
         assert_eq!(response.status_code(), 200);
         let body = response.text();
 
-        assert!(body.contains(r#"<div class="highlight">"#));
-        assert!(body.contains(r#"<span style="color: red;">"#));
-        assert!(body.contains("<p>This should be rendered as HTML, not escaped</p>"));
-        assert!(!body.contains("&lt;div"));
-        assert!(!body.contains("&gt;"));
-        assert!(body.contains("<strong>markdown</strong>"));
+        // Scope the "not escaped" checks to the rendered region; the raw-source
+        // view legitimately contains the escaped markdown.
+        let rendered = rendered_region(&body);
+        assert!(rendered.contains(r#"<div class="highlight">"#));
+        assert!(rendered.contains(r#"<span style="color: red;">"#));
+        assert!(rendered.contains("<p>This should be rendered as HTML, not escaped</p>"));
+        assert!(!rendered.contains("&lt;div"));
+        assert!(!rendered.contains("&gt;"));
+        assert!(rendered.contains("<strong>markdown</strong>"));
+    }
+
+    #[tokio::test]
+    async fn test_raw_source_view_embedded() {
+        let markdown_content = "# Title\n\nSome **bold** text with <angle> brackets.\n";
+        let (server, _temp_file) = create_test_server(markdown_content).await;
+
+        let response = server.get("/").await;
+        assert_eq!(response.status_code(), 200);
+        let body = response.text();
+
+        // The toggle button and the raw-source container are present.
+        assert!(body.contains("id=\"rawToggle\""), "raw toggle button missing");
+        assert!(body.contains("id=\"raw-content\""), "raw view container missing");
+
+        // The raw view carries the markdown source as a highlighted code block,
+        // with the source HTML-escaped (so `<angle>` doesn't become a real tag).
+        let raw = body
+            .split("<div id=\"raw-content\">")
+            .nth(1)
+            .expect("raw-content region");
+        assert!(
+            raw.contains("<pre><code class=\"language-markdown\">"),
+            "raw view should be a markdown code block"
+        );
+        // The angle brackets are HTML-escaped (highlighting may split them into
+        // separate spans, so check the escaped chars rather than a contiguous
+        // run) and never emitted as a real `<angle>` tag.
+        assert!(
+            raw.contains("&lt;") && raw.contains("&gt;"),
+            "raw source should be HTML-escaped in the raw view"
+        );
+        assert!(
+            !raw.contains("<angle>"),
+            "raw source must not emit a literal tag"
+        );
+        // Highlight CSS is included because the raw view is highlighted.
+        assert!(body.contains(SYN_PREFIX), "highlight CSS/spans expected");
     }
 
     #[tokio::test]
@@ -3304,9 +3432,12 @@ classDiagram
         assert_eq!(response.status_code(), 200);
         let body = response.text();
 
-        assert!(!body.contains("title: Test Post"));
-        assert!(!body.contains("author: Name"));
-        assert!(body.contains("<h1 id=\"test-post\">"));
+        // Frontmatter is stripped from the rendered output; it still appears in
+        // the raw-source view, so scope these checks to the rendered region.
+        let rendered = rendered_region(&body);
+        assert!(!rendered.contains("title: Test Post"));
+        assert!(!rendered.contains("author: Name"));
+        assert!(rendered.contains("<h1 id=\"test-post\">"));
     }
 
     #[tokio::test]
@@ -3318,8 +3449,9 @@ classDiagram
         assert_eq!(response.status_code(), 200);
         let body = response.text();
 
-        assert!(!body.contains("title = \"Test Post\""));
-        assert!(body.contains("<h1 id=\"test-post\">"));
+        let rendered = rendered_region(&body);
+        assert!(!rendered.contains("title = \"Test Post\""));
+        assert!(rendered.contains("<h1 id=\"test-post\">"));
     }
 
     #[tokio::test]

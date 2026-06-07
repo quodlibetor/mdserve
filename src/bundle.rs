@@ -60,13 +60,14 @@ pub(crate) struct BundleEntry {
 }
 
 /// Build the zip for `roots` and their recursively-collected local deps.
-/// `render` turns an (html_body, title) into a full standalone page.
+/// `render` turns an (html_body, title, asset_prefix, raw_markdown_source) into
+/// a full standalone page.
 pub(crate) fn build_zip(
     base_dir: &Path,
     roots: &[RootDoc],
     is_directory_mode: bool,
     include_external: bool,
-    render: fn(&str, &str, &str) -> String,
+    render: fn(&str, &str, &str, &str) -> String,
 ) -> Result<Vec<u8>> {
     let entries = build_entries(base_dir, roots, is_directory_mode, include_external, render);
     zip_entries(&entries)
@@ -254,6 +255,19 @@ fn swap_ext_to_html(path: &str) -> String {
         .replace('\\', "/")
 }
 
+/// The zip path for a page's raw markdown: its (already-unique) `.html` zip path
+/// with the original markdown extension restored (e.g. `guide.html` for a
+/// `.markdown` source becomes `guide.markdown`). Since each page's `.html` path
+/// is unique and markdown sources never share the `.html` namespace, the derived
+/// source path is unique too.
+fn source_zip_path(html_zip: &str, abs: &Path) -> String {
+    let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("md");
+    Path::new(html_zip)
+        .with_extension(ext)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 /// Compute a relative path from one zip entry to another, as forward-slash path
 /// math (`../` up to the common ancestor, then down).
 fn rel_zip_path(from_page: &str, to_target: &str) -> String {
@@ -399,6 +413,9 @@ struct PageWork {
     zip_path: String,
     body: String,
     title: String,
+    /// Raw markdown source, bundled alongside the rendered page as a `.md` file
+    /// and used to render the page's view-source toggle.
+    source: String,
 }
 
 fn title_for(abs: &Path) -> String {
@@ -413,7 +430,7 @@ fn build_entries(
     roots: &[RootDoc],
     is_directory_mode: bool,
     include_external: bool,
-    render: fn(&str, &str, &str) -> String,
+    render: fn(&str, &str, &str, &str) -> String,
 ) -> Vec<BundleEntry> {
     // canonical source path -> zip path
     let mut visited: HashMap<PathBuf, String> = HashMap::new();
@@ -495,6 +512,7 @@ fn build_entries(
             abs,
             zip_path,
             body,
+            source,
         });
     }
 
@@ -509,11 +527,25 @@ fn build_entries(
         }
         let referrer_dir = page.abs.parent().unwrap_or(base_dir).to_path_buf();
         let rewritten = rewrite_html_links(&page.body, &page.zip_path, &referrer_dir, &visited);
-        let full = render(&rewritten, &page.title, &asset_prefix(&page.zip_path));
+        let full = render(
+            &rewritten,
+            &page.title,
+            &asset_prefix(&page.zip_path),
+            &page.source,
+        );
         total_bytes += full.len() as u64;
         entries.push(BundleEntry {
             zip_path: page.zip_path.clone(),
             bytes: full.into_bytes(),
+        });
+
+        // Bundle the raw markdown next to its rendered page (e.g. `guide.md`
+        // beside `guide.html`), so the source travels with the bundle.
+        let raw_zip = source_zip_path(&page.zip_path, &page.abs);
+        total_bytes += page.source.len() as u64;
+        entries.push(BundleEntry {
+            zip_path: raw_zip,
+            bytes: page.source.clone().into_bytes(),
         });
     }
 
@@ -565,7 +597,8 @@ fn build_entries(
     // natural entry point.
     if is_directory_mode && !entries.iter().any(|e| e.zip_path == "index.html") {
         let body = build_index_body(&roots_in_order, &visited);
-        let full = render(&body, "Index", "");
+        // No markdown source for the generated index, so no view-source toggle.
+        let full = render(&body, "Index", "", "");
         entries.push(BundleEntry {
             zip_path: "index.html".to_string(),
             bytes: full.into_bytes(),

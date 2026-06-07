@@ -28,8 +28,13 @@ kinds of content AI coding agents actually produce.
 
 **Offline bundle download.** The ⬇️ button (or `GET /api/download`) packages the
 served markdown as a self-contained `.zip`: each file rendered to offline HTML
-(sharing one bundled mermaid library), all locally-referenced assets and linked
-files collected recursively, and links rewritten so it works by double-clicking.
+(sharing one bundled mermaid library) plus its raw `.md` source, all
+locally-referenced assets and linked files collected recursively, and links
+rewritten so it works by double-clicking.
+
+**View source toggle.** The 📄 button in the top-right switches any page between
+the rendered output and its syntax-highlighted markdown source. The choice is
+remembered, and works the same in the live preview and the offline bundle.
 
 ## What mdserve is not
 
@@ -158,8 +163,10 @@ mdserve README.md --open
 
 The ⬇️ button in the top-right (or `GET /api/download`) downloads a `.zip` you
 can open without a server. Every served markdown file is rendered to an offline
-HTML page; pages share a single bundled copy of the mermaid/panzoom libraries
-(under `_assets/`) so a bundle with many diagrams stays small. Local
+HTML page and bundled alongside its raw `.md` source (so the source travels with
+the bundle, and each page's 📄 toggle can show it); pages share a single bundled
+copy of the mermaid/panzoom libraries (under `_assets/`) so a bundle with many
+diagrams stays small. Local
 dependencies are collected recursively: images, PDFs, and linked markdown files
 are pulled in - including `file://` and absolute paths outside the served
 directory (placed under `_external/`) - with links rewritten to point at the
