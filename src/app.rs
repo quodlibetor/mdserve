@@ -31,6 +31,7 @@ use tokio::{
     sync::{broadcast, mpsc, Mutex},
 };
 use tower_http::cors::CorsLayer;
+use yaml_rust2::{Yaml, YamlEmitter, YamlLoader};
 
 const TEMPLATE_NAME: &str = "main.html";
 static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
@@ -330,8 +331,9 @@ impl MarkdownState {
 }
 
 /// Renders markdown source to an HTML body fragment (GFM, raw HTML allowed,
-/// frontmatter parsed out). Used by the live server. Non-http link protocols
-/// (e.g. `javascript:`, `file:`) are sanitized out, as in upstream defaults.
+/// frontmatter rendered as a metadata table). Used by the live server.
+/// Non-http link protocols (e.g. `javascript:`, `file:`) are sanitized out, as
+/// in upstream defaults.
 pub(crate) fn markdown_to_html(content: &str) -> Result<String> {
     markdown_to_html_inner(content, false)
 }
@@ -354,7 +356,137 @@ fn markdown_to_html_inner(content: &str, allow_dangerous_protocol: bool) -> Resu
 
     let html_body = render_github_alerts(&html_body);
     let html_body = add_heading_ids(&html_body);
+    let html_body = match extract_frontmatter(content) {
+        Some(fm) => format!("{}{}", render_frontmatter(&fm), html_body),
+        None => html_body,
+    };
     Ok(highlight_code_blocks(&html_body))
+}
+
+/// A frontmatter block found at the top of a markdown document.
+struct Frontmatter<'a> {
+    /// Highlight language for the fallback code block: `---` fences are yaml,
+    /// `+++` fences are toml.
+    lang: &'static str,
+    text: &'a str,
+}
+
+/// Extracts the frontmatter block that the markdown parser strips, so it can
+/// be rendered instead of dropped. Requires the fence lines to be exactly the
+/// marker (the parser is at least as lenient), so anything accepted here is
+/// also stripped from the parsed document and never appears twice.
+fn extract_frontmatter(content: &str) -> Option<Frontmatter<'_>> {
+    let first_line_end = content.find('\n')?;
+    let first_line = content[..first_line_end].trim_end_matches('\r');
+    let (fence, lang) = match first_line {
+        "---" => ("---", "yaml"),
+        "+++" => ("+++", "toml"),
+        _ => return None,
+    };
+    let rest = &content[first_line_end + 1..];
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == fence {
+            return Some(Frontmatter {
+                lang,
+                text: &rest[..offset],
+            });
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Renders frontmatter the way GitHub does: a YAML mapping becomes a table
+/// with the keys as the header row and the values beneath. TOML frontmatter
+/// and YAML that doesn't parse as a mapping fall back to a highlighted code
+/// block so the metadata is still visible.
+fn render_frontmatter(fm: &Frontmatter) -> String {
+    if fm.lang == "yaml" {
+        match YamlLoader::load_from_str(fm.text).map(|mut docs| docs.drain(..).next()) {
+            Ok(None) | Ok(Some(Yaml::Null)) => return String::new(),
+            Ok(Some(Yaml::Hash(map))) => return frontmatter_table(&map),
+            _ => {}
+        }
+    }
+    let text = fm.text.trim_end();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<pre><code class=\"language-{}\">{}\n</code></pre>",
+        fm.lang,
+        escape_html_text(text)
+    )
+}
+
+fn frontmatter_table(map: &yaml_rust2::yaml::Hash) -> String {
+    if map.is_empty() {
+        return String::new();
+    }
+    let mut head = String::new();
+    let mut body = String::new();
+    for (key, value) in map {
+        head.push_str("<th>");
+        head.push_str(&escape_html_text(&yaml_scalar_text(key)));
+        head.push_str("</th>");
+        body.push_str("<td>");
+        body.push_str(&frontmatter_value(value));
+        body.push_str("</td>");
+    }
+    format!(
+        "<table class=\"frontmatter\">\
+         <thead><tr>{head}</tr></thead>\
+         <tbody><tr>{body}</tr></tbody>\
+         </table>"
+    )
+}
+
+fn frontmatter_value(value: &Yaml) -> String {
+    match value {
+        Yaml::Array(items) if items.iter().all(yaml_is_scalar) => {
+            let mut out = String::from("<ul>");
+            for item in items {
+                out.push_str("<li>");
+                out.push_str(&escape_html_text(&yaml_scalar_text(item)));
+                out.push_str("</li>");
+            }
+            out.push_str("</ul>");
+            out
+        }
+        Yaml::Array(_) | Yaml::Hash(_) => format!(
+            "<pre><code class=\"language-yaml\">{}</code></pre>",
+            escape_html_text(&yaml_dump(value))
+        ),
+        scalar => escape_html_text(&yaml_scalar_text(scalar)),
+    }
+}
+
+fn yaml_is_scalar(value: &Yaml) -> bool {
+    !matches!(value, Yaml::Array(_) | Yaml::Hash(_))
+}
+
+/// Plain-text form of a scalar YAML value.
+fn yaml_scalar_text(value: &Yaml) -> String {
+    match value {
+        Yaml::String(s) => s.clone(),
+        Yaml::Real(s) => s.clone(),
+        Yaml::Integer(i) => i.to_string(),
+        Yaml::Boolean(b) => b.to_string(),
+        Yaml::Null => String::new(),
+        other => yaml_dump(other),
+    }
+}
+
+/// Re-emits a YAML value as source text, for nested structures that are shown
+/// verbatim rather than flattened into a cell.
+fn yaml_dump(value: &Yaml) -> String {
+    let mut out = String::new();
+    if YamlEmitter::new(&mut out).dump(value).is_err() {
+        return String::new();
+    }
+    // The emitter prefixes every document with a `---` marker line.
+    out.strip_prefix("---").unwrap_or(&out).trim().to_string()
 }
 
 /// CSS class prefix for syntax-highlight spans. Namespaces the generated rules
@@ -2097,7 +2229,9 @@ mod tests {
     /// leaked into the *rendered* HTML — the source legitimately appears in the
     /// (hidden) raw view.
     fn rendered_region(body: &str) -> &str {
-        body.split("<div id=\"raw-content\">").next().unwrap_or(body)
+        body.split("<div id=\"raw-content\">")
+            .next()
+            .unwrap_or(body)
     }
 
     async fn create_test_server_with_http(content: &str) -> (TestServer, NamedTempFile) {
@@ -2776,8 +2910,14 @@ Regular **markdown** still works.
         let body = response.text();
 
         // The toggle button and the raw-source container are present.
-        assert!(body.contains("id=\"rawToggle\""), "raw toggle button missing");
-        assert!(body.contains("id=\"raw-content\""), "raw view container missing");
+        assert!(
+            body.contains("id=\"rawToggle\""),
+            "raw toggle button missing"
+        );
+        assert!(
+            body.contains("id=\"raw-content\""),
+            "raw view container missing"
+        );
 
         // The raw view carries the markdown source as a highlighted code block,
         // with the source HTML-escaped (so `<angle>` doesn't become a real tag).
@@ -3424,7 +3564,7 @@ classDiagram
     }
 
     #[tokio::test]
-    async fn test_yaml_frontmatter_is_stripped() {
+    async fn test_yaml_frontmatter_renders_as_metadata_table() {
         let (server, _temp_file) = create_test_server(YAML_FRONTMATTER_CONTENT).await;
 
         let response = server.get("/").await;
@@ -3432,16 +3572,21 @@ classDiagram
         assert_eq!(response.status_code(), 200);
         let body = response.text();
 
-        // Frontmatter is stripped from the rendered output; it still appears in
-        // the raw-source view, so scope these checks to the rendered region.
+        // Frontmatter renders as a GitHub-style table instead of the raw
+        // `key: value` text; scope checks to the rendered region since the
+        // raw-source view still contains the original text.
         let rendered = rendered_region(&body);
         assert!(!rendered.contains("title: Test Post"));
-        assert!(!rendered.contains("author: Name"));
+        assert!(rendered.contains("<table class=\"frontmatter\">"));
+        assert!(rendered.contains("<th>title</th>"));
+        assert!(rendered.contains("<td>Test Post</td>"));
+        assert!(rendered.contains("<th>author</th>"));
+        assert!(rendered.contains("<td>Name</td>"));
         assert!(rendered.contains("<h1 id=\"test-post\">"));
     }
 
     #[tokio::test]
-    async fn test_toml_frontmatter_is_stripped() {
+    async fn test_toml_frontmatter_renders_as_code_block() {
         let (server, _temp_file) = create_test_server(TOML_FRONTMATTER_CONTENT).await;
 
         let response = server.get("/").await;
@@ -3450,8 +3595,55 @@ classDiagram
         let body = response.text();
 
         let rendered = rendered_region(&body);
-        assert!(!rendered.contains("title = \"Test Post\""));
+        assert!(rendered.contains("<pre><code class=\"language-toml\">"));
         assert!(rendered.contains("<h1 id=\"test-post\">"));
+    }
+
+    #[test]
+    fn test_frontmatter_list_values_render_as_lists() {
+        let html =
+            markdown_to_html("---\ntitle: Post\ntags:\n  - rust\n  - markdown\n---\n\n# Hi\n")
+                .unwrap();
+        assert!(html.contains("<th>tags</th>"));
+        assert!(html.contains("<td><ul><li>rust</li><li>markdown</li></ul></td>"));
+    }
+
+    #[test]
+    fn test_frontmatter_nested_values_render_as_yaml() {
+        let html = markdown_to_html("---\nauthor:\n  name: Ada\n---\n\nbody\n").unwrap();
+        assert!(html.contains("<th>author</th>"));
+        // The nested mapping is re-emitted as YAML and syntax-highlighted, so
+        // the key and value appear inside highlight spans.
+        assert!(html.contains("<td><pre><code class=\"language-yaml\">"));
+        assert!(html.contains("name"));
+        assert!(html.contains("Ada"));
+    }
+
+    #[test]
+    fn test_invalid_yaml_frontmatter_falls_back_to_code_block() {
+        let html = markdown_to_html("---\n: : :\n---\n\nbody\n").unwrap();
+        assert!(html.contains("<pre><code class=\"language-yaml\">"));
+    }
+
+    #[test]
+    fn test_frontmatter_values_are_escaped() {
+        let html =
+            markdown_to_html("---\ntitle: <script>alert(1)</script>\n---\n\nbody\n").unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_unclosed_fence_is_not_frontmatter() {
+        let html = markdown_to_html("---\ntitle: Post\n\nbody\n").unwrap();
+        assert!(!html.contains("frontmatter"));
+    }
+
+    #[test]
+    fn test_empty_frontmatter_renders_nothing() {
+        let html = markdown_to_html("---\n---\n\n# Hi\n").unwrap();
+        assert!(!html.contains("frontmatter"));
+        assert!(!html.contains("<pre><code class=\"language-yaml\">"));
     }
 
     #[tokio::test]
