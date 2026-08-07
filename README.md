@@ -24,8 +24,8 @@ done. mdserve is not a long-running server and doesn't need to be.
 **Agent-friendly content.** Full GFM support (tables, task lists,
 syntax-highlighted code), Mermaid diagrams, GitHub alerts (`> [!NOTE]`), heading
 anchors for in-page `#links`, YAML frontmatter rendered as a GitHub-style
-metadata table, and directory mode with sidebar navigation - the kinds of
-content AI coding agents actually produce.
+metadata table, and directory mode with a filterable sidebar file tree - the
+kinds of content AI coding agents actually produce.
 
 **Offline bundle download.** The ⬇️ button (or `GET /api/download`) packages the
 served markdown as a self-contained `.zip`: each file rendered to offline HTML
@@ -150,7 +150,12 @@ mdserve README.md --open
 
 **Directory Mode**: When you pass a directory path, mdserve automatically:
 - Scans and serves all `.md` and `.markdown` files in that directory
-- Displays a navigation sidebar for easy switching between files
+- Displays a navigation sidebar for easy switching between files, as a
+  collapsible directory tree — directories start closed, except the ones
+  holding the file you're reading, and reopen where you left them next time
+- Filters the tree from a search box (or press `/`): terms match anywhere in a
+  file's path and all of them must match, so `api v2` finds `docs/api/v2.md`
+- Resizes by dragging the sidebar's right edge; double-click it to reset
 - Watches for new markdown files added to the directory
 - Recurses into subdirectories by default, respecting `.gitignore` and skipping
   hidden directories (use `--no-recursive` to scan only the immediate directory)

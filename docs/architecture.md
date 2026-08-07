@@ -33,7 +33,7 @@ mdserve ./docs/
 ```
 - Watches specified directory
 - Tracks all `.md` and `.markdown` files
-- Shows navigation sidebar
+- Shows navigation sidebar: a collapsible file tree, filterable and resizable
 
 ## Architecture
 
@@ -156,9 +156,43 @@ Template variables:
 - `content`: Pre-rendered markdown HTML
 - `mermaid_enabled`: Boolean flag, conditionally includes Mermaid.js when diagrams detected
 - `show_navigation`: Controls sidebar visibility
-- `files`: List of tracked files (directory mode)
+- `file_tree`: Tracked files grouped into a directory tree (directory mode)
 - `current_file`: Active file name (directory mode)
 - `awaiting_files`: Marks the placeholder page shown before any file is indexed
+
+### Sidebar file tree
+
+`build_file_tree` groups the sorted relative paths into nested
+`{dirs, files}` nodes, which the template's recursive `file_tree_ul` macro
+renders as nested `<ul>`s with each directory a `<details>`. Directories sort
+ahead of files at every level, and each row carries its relative path in
+`data-path`.
+
+Directories start collapsed, apart from those containing the file being
+viewed — the server marks those `open` so the tree always reveals where you
+are. Everything else about the tree's state lives in the browser:
+
+- **Expanded directories** are kept in `localStorage`, written on a click on
+  the directory row. Deliberately *not* written from the `toggle` event, which
+  fires identically when filtering opens a directory programmatically.
+- **Sidebar width** is kept in `localStorage` and applied to the
+  `--sidebar-width` custom property. The drag handle uses pointer capture, and
+  the width is re-clamped against the viewport on window resize without
+  overwriting the stored preference.
+- **The filter** is transient. Terms match case-insensitively against the whole
+  relative path and must all match; non-matching rows get `hidden`, directories
+  survive only while something under them does, and a directory whose own name
+  matches keeps all its contents.
+
+Expanded state and width are both restored before first paint — the width from
+the head script (it is just a custom property), the expanded directories from a
+parser-blocking script placed immediately after the sidebar markup, where the
+DOM it needs already exists.
+
+`buildFileTree` in the template mirrors `build_file_tree` in `src/app.rs`: the
+server renders the initial page, and the client rebuilds the same markup from
+the flat list streamed over the WebSocket as a background scan proceeds. Any
+active filter is reapplied to the rebuilt tree.
 
 ### Offline bundle (`src/bundle.rs`)
 
@@ -198,7 +232,7 @@ bundle renderer; the live preview keeps the stricter sanitization. Uses the
 
 **Scan in the background**: Serving starts immediately and the file list streams to clients, rather than making startup wait on a full walk. The cost is that a file can 404 briefly before the scan reaches it.
 
-**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript stays small (theme management, reload execution, sidebar list updates, rendered/source view toggle).
+**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, tree grouping, active file highlighting, live reload triggering). Client-side JavaScript stays small (theme management, reload execution, sidebar tree updates, and the parts of the sidebar that are inherently local to the reader: which directories they expanded, how wide they dragged it, what they typed in the filter).
 
 ## Constraints
 
