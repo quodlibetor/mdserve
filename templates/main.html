@@ -178,7 +178,7 @@
         }
 
         .sidebar-content {
-            padding: 0 20px 20px 20px;
+            padding: 0 12px 20px 12px;
             opacity: 1;
             transition: opacity 0.2s var(--transition-timing);
         }
@@ -188,29 +188,76 @@
             pointer-events: none;
         }
 
-        /* File Navigation List */
-        .file-list {
+        /* File Navigation Tree */
+        .file-list,
+        .tree-children {
             list-style: none;
             padding: 0;
             margin: 0;
         }
 
-        .file-list li {
-            margin-bottom: 4px;
+        /* One indent step per level, with a guide line at the parent's depth
+           so deep nesting stays readable in a narrow sidebar. */
+        .tree-children {
+            margin-left: 9px;
+            padding-left: 8px;
+            border-left: 1px solid var(--border-color);
         }
 
-        .file-list a {
+        .file-list li {
+            margin-bottom: 2px;
+        }
+
+        .file-list a,
+        .tree-dir-name {
             display: block;
-            padding: 8px 12px;
+            padding: 5px 8px;
             color: var(--text-color);
             text-decoration: none;
             border-radius: 6px;
             transition: background 0.2s var(--transition-timing);
             font-size: 14px;
+            /* Long names truncate instead of widening the sidebar. */
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .tree-dir-name {
+            cursor: pointer;
+            font-weight: 600;
+            user-select: none;
+            /* `display: block` drops the disclosure triangle in most engines;
+               these cover Firefox and older WebKit. We draw our own below. */
+            list-style: none;
+        }
+
+        .tree-dir-name::-webkit-details-marker {
+            display: none;
+        }
+
+        .tree-dir-name::before {
+            content: '';
+            display: inline-block;
+            width: 0;
+            height: 0;
+            margin-right: 6px;
+            vertical-align: baseline;
+            border-left: 4px solid currentColor;
+            border-top: 4px solid transparent;
+            border-bottom: 4px solid transparent;
+            opacity: 0.65;
+            transition: transform 0.15s var(--transition-timing);
+        }
+
+        .tree-dir > details[open] > .tree-dir-name::before {
+            transform: rotate(90deg);
         }
 
         .file-list a:hover,
-        .file-list a:focus-visible {
+        .file-list a:focus-visible,
+        .tree-dir-name:hover,
+        .tree-dir-name:focus-visible {
             background: var(--border-color-light);
             outline: none;
         }
@@ -971,33 +1018,161 @@
             releaseModalFocus(modal);
         }
 
-        // Replaces the sidebar links with `files`. The server streams this list
-        // while it walks a directory in the background, so a large tree fills in
-        // without disturbing the page being read. A page that has nothing to show
-        // yet reloads instead, to pick up the first file the scan finds.
+        // Which directories the reader has expanded, by relative path.
+        // Directories start collapsed, so this is the whole of the tree's
+        // remembered state; localStorage keeps it across reloads.
+        const EXPANDED_DIRS_KEY = 'sidebar-expanded-dirs';
+
+        function expandedDirs() {
+            try {
+                const stored = JSON.parse(localStorage.getItem(EXPANDED_DIRS_KEY));
+                return new Set(Array.isArray(stored) ? stored : []);
+            } catch (error) {
+                return new Set();
+            }
+        }
+
+        // A directory is open if the reader expanded it, or if it holds the file
+        // being viewed — the active file is always revealed, however deep it is.
+        function isDirOpen(path, expanded, current) {
+            return expanded.has(path) || (current || '').startsWith(path + '/');
+        }
+
+        // Applies the stored state to the server-rendered tree, which knows only
+        // to open the active file's ancestors — it can't see localStorage.
+        function applyExpandedDirs() {
+            const expanded = expandedDirs();
+            const current = document.body.dataset.currentFile;
+            document.querySelectorAll('.sidebar .tree-dir').forEach(function(item) {
+                const details = item.querySelector(':scope > details');
+                if (details) {
+                    details.open = isDirOpen(item.dataset.path, expanded, current);
+                }
+            });
+        }
+
+        function initFileTree() {
+            const sidebar = document.querySelector('.sidebar');
+            if (!sidebar) {
+                return;
+            }
+            // `toggle` doesn't bubble, so listen in the capture phase. Delegating
+            // from the sidebar keeps this working after a scan update replaces
+            // the whole tree.
+            sidebar.addEventListener('toggle', function(e) {
+                const item = e.target.closest('.tree-dir');
+                if (!item) {
+                    return;
+                }
+                const expanded = expandedDirs();
+                if (e.target.open) {
+                    expanded.add(item.dataset.path);
+                } else {
+                    expanded.delete(item.dataset.path);
+                }
+                localStorage.setItem(EXPANDED_DIRS_KEY, JSON.stringify([...expanded]));
+            }, true);
+        }
+
+        // Groups a flat, sorted list of relative paths into {dirs, files}.
+        // Mirrors `build_file_tree` in app.rs, which produces the same shape for
+        // the server-rendered page; the sort below matches its per-level
+        // directory ordering, which first-seen order alone wouldn't give
+        // ("a-b/x.md" sorts before "a/x.md", but directory "a" comes first).
+        function buildFileTree(paths) {
+            const root = { dirs: [], files: [] };
+            const byPath = new Map();
+
+            for (const path of paths) {
+                const segments = path.split('/');
+                const name = segments.pop();
+                let node = root;
+                let prefix = '';
+                for (const segment of segments) {
+                    prefix = prefix ? prefix + '/' + segment : segment;
+                    let child = byPath.get(prefix);
+                    if (!child) {
+                        child = { name: segment, path: prefix, dirs: [], files: [] };
+                        byPath.set(prefix, child);
+                        node.dirs.push(child);
+                    }
+                    node = child;
+                }
+                node.files.push({ name: name, path: path });
+            }
+
+            (function sortDirs(node) {
+                node.dirs.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+                node.dirs.forEach(sortDirs);
+            })(root);
+
+            return root;
+        }
+
+        // Builds the same markup the `file_tree_ul` template macro emits.
+        // Directories are created already in their stored open/closed state so
+        // a rebuild neither flashes nor writes that state back.
+        function renderFileTree(node, current, expanded, cls) {
+            const list = document.createElement('ul');
+            list.className = cls;
+
+            for (const dir of node.dirs) {
+                const item = document.createElement('li');
+                item.className = 'tree-dir';
+                item.dataset.path = dir.path;
+
+                const details = document.createElement('details');
+                details.open = isDirOpen(dir.path, expanded, current);
+                const summary = document.createElement('summary');
+                summary.className = 'tree-dir-name';
+                summary.textContent = dir.name;
+                details.append(summary, renderFileTree(dir, current, expanded, 'tree-children'));
+
+                item.appendChild(details);
+                list.appendChild(item);
+            }
+
+            for (const file of node.files) {
+                const item = document.createElement('li');
+                item.className = 'tree-file';
+                item.dataset.path = file.path;
+
+                const link = document.createElement('a');
+                // Built with the DOM rather than markup, so a filename cannot
+                // inject HTML. Matches the server-rendered href exactly.
+                link.setAttribute('href', '/' + file.path);
+                link.textContent = file.name;
+                if (file.path === current) {
+                    link.className = 'active';
+                }
+
+                item.appendChild(link);
+                list.appendChild(item);
+            }
+
+            return list;
+        }
+
+        // Replaces the sidebar tree with one built from `files`. The server
+        // streams this list while it walks a directory in the background, so a
+        // large tree fills in without disturbing the page being read. A page that
+        // has nothing to show yet reloads instead, to pick up the first file the
+        // scan finds.
         function updateFileList(files) {
             if (document.body.dataset.awaitingFiles !== undefined && files.length > 0) {
                 window.location.reload();
                 return;
             }
-            const list = document.querySelector('.file-list');
+            const list = document.querySelector('.sidebar .file-list');
             if (!list) {
                 return;
             }
-            const current = document.body.dataset.currentFile;
-            list.replaceChildren(...files.map(function(name) {
-                const link = document.createElement('a');
-                // Built with the DOM rather than markup, so a filename cannot
-                // inject HTML. Matches the server-rendered href exactly.
-                link.setAttribute('href', '/' + name);
-                link.textContent = name;
-                if (name === current) {
-                    link.className = 'active';
-                }
-                const item = document.createElement('li');
-                item.appendChild(link);
-                return item;
-            }));
+            list.replaceWith(renderFileTree(
+                buildFileTree(files),
+                document.body.dataset.currentFile,
+                expandedDirs(),
+                'file-list'
+            ));
         }
 
         // Auto-refresh functionality using WebSocket.
@@ -1043,6 +1218,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             initTheme();
             initSidebar();
+            initFileTree();
             initRawView();
             initMermaid();
             setupLiveReload();
@@ -1079,6 +1255,25 @@
 </head>
 <body{% if show_navigation %} data-current-file="{{ current_file }}"{% endif %}{% if awaiting_files %} data-awaiting-files{% endif %}>
 {% if show_navigation %}
+{#- Renders one level of the file tree. `node` is {dirs, files} as built by
+    `build_file_tree` in app.rs; the macro recurses on each directory entry. -#}
+{% macro file_tree_ul(node, cls) %}
+<ul class="{{ cls }}">
+    {%- for dir in node.dirs %}
+    <li class="tree-dir" data-path="{{ dir.path }}">
+        <details{% if dir.open %} open{% endif %}>
+            <summary class="tree-dir-name">{{ dir.name }}</summary>
+            {{- file_tree_ul(dir, "tree-children") }}
+        </details>
+    </li>
+    {%- endfor %}
+    {%- for file in node.files %}
+    <li class="tree-file" data-path="{{ file.path }}">
+        <a href="{{ file.href }}"{% if file.active %} class="active"{% endif %}>{{ file.name }}</a>
+    </li>
+    {%- endfor %}
+</ul>
+{% endmacro %}
 <button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar">
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
         <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
@@ -1088,17 +1283,15 @@
 <nav class="sidebar">
     <div class="sidebar-header"></div>
     <div class="sidebar-content">
-        <ul class="file-list">
-            {% for file in files %}
-            <li>
-                <a href="{{ file.href }}"{% if file.name == current_file %} class="active"{% endif %}>
-                    {{ file.name }}
-                </a>
-            </li>
-            {% endfor %}
-        </ul>
+        {{- file_tree_ul(file_tree, "file-list") }}
     </div>
 </nav>
+<script>
+    // Runs here, parser-blocking and immediately after the sidebar markup,
+    // rather than on DOMContentLoaded: a directory the user expanded must
+    // never flash closed before being opened again.
+    applyExpandedDirs();
+</script>
 {% endif %}
 
 {% if show_download %}

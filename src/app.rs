@@ -184,6 +184,97 @@ pub(crate) fn relative_key(base_dir: &Path, path: &Path) -> String {
         .join("/")
 }
 
+/// A directory in the sidebar file tree, keyed by path segment. `BTreeMap`
+/// keeps subdirectories sorted without a second pass.
+#[derive(Default)]
+struct TreeDir {
+    subdirs: std::collections::BTreeMap<String, TreeDir>,
+    /// Full relative keys (`docs/guide.md`) of the files directly in here.
+    files: Vec<String>,
+}
+
+/// Converts a directory into the shape the template's recursive `file_tree_ul`
+/// macro walks: `{dirs: [{name, path, dirs, files}], files: [{name, path,
+/// href, active}]}`. A directory entry carries its own `dirs`/`files` so the
+/// macro can recurse on it directly. Directories come before files at every
+/// level, each group sorted — an order the flat list's sort alone doesn't give.
+///
+/// `path` is the directory's own relative path, used to prefix its children's;
+/// the root passes "". `current` is the file being viewed: it is flagged
+/// `active`, and the directories containing it are flagged `open` so the tree
+/// always reveals where you are. Every other directory starts collapsed; the
+/// client reopens the ones the reader expanded before.
+///
+/// `path` and `href` are pre-escaped safe strings so multi-segment paths read
+/// as `docs/api` rather than `docs&#x2f;api`; every component is still
+/// HTML-escaped, so a filename can't break out of the attribute.
+fn tree_dir_map(dir: TreeDir, path: &str, current: &str) -> HashMap<String, Value> {
+    let dirs: Vec<Value> = dir
+        .subdirs
+        .into_iter()
+        .map(|(name, subdir)| {
+            let subpath = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            let contains_current = current.starts_with(&format!("{subpath}/"));
+            let mut map = tree_dir_map(subdir, &subpath, current);
+            map.insert("name".to_string(), Value::from(name));
+            map.insert("open".to_string(), Value::from(contains_current));
+            map.insert(
+                "path".to_string(),
+                Value::from_safe_string(html_escape_keep_slash(&subpath)),
+            );
+            Value::from_object(map)
+        })
+        .collect();
+
+    let files: Vec<Value> = dir
+        .files
+        .into_iter()
+        .map(|key| {
+            let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+            let escaped = html_escape_keep_slash(&key);
+            let mut map = HashMap::new();
+            map.insert("name".to_string(), Value::from(name));
+            map.insert("active".to_string(), Value::from(key == current));
+            map.insert(
+                "href".to_string(),
+                Value::from_safe_string(format!("/{escaped}")),
+            );
+            map.insert("path".to_string(), Value::from_safe_string(escaped));
+            Value::from_object(map)
+        })
+        .collect();
+
+    let mut map = HashMap::new();
+    map.insert("dirs".to_string(), Value::from(dirs));
+    map.insert("files".to_string(), Value::from(files));
+    map
+}
+
+/// Groups sorted relative file keys into a directory tree for the sidebar.
+/// Mirrors `buildFileTree` in the template, which rebuilds the same shape from
+/// the flat list the server streams over the WebSocket during a scan.
+fn build_file_tree(filenames: &[String], current: &str) -> Value {
+    let mut root = TreeDir::default();
+
+    for key in filenames {
+        let mut node = &mut root;
+        let mut segments = key.split('/').peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                node.files.push(key.clone());
+            } else {
+                node = node.subdirs.entry(segment.to_string()).or_default();
+            }
+        }
+    }
+
+    Value::from_object(tree_dir_map(root, "", current))
+}
+
 /// HTML-escapes a string for use in an attribute value, but leaves `/`
 /// untouched so multi-segment paths read as `/a/b.md` rather than
 /// `/a&#x2f;b.md` while remaining safe against injection.
@@ -1254,7 +1345,7 @@ fn render_empty_page(state: &MarkdownState) -> (StatusCode, Html<String>) {
             content => Value::from_safe_string(format!("<p>{message}</p>")),
             mermaid_enabled => false,
             show_navigation => state.show_navigation(),
-            files => Vec::<Value>::new(),
+            file_tree => build_file_tree(&[], ""),
             current_file => "",
             page_title => "mdserve",
             standalone => state.standalone,
@@ -1336,24 +1427,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
     };
 
     let rendered = if state.show_navigation() {
-        let filenames = state.get_sorted_filenames();
-        let files: Vec<Value> = filenames
-            .iter()
-            .map(|name| {
-                Value::from_object({
-                    let mut map = std::collections::HashMap::new();
-                    map.insert("name".to_string(), Value::from(name.clone()));
-                    // Build the href ourselves so path separators stay as "/"
-                    // instead of being autoescaped to "&#x2f;". Each path
-                    // component is still HTML-escaped to stay XSS-safe.
-                    map.insert(
-                        "href".to_string(),
-                        Value::from_safe_string(format!("/{}", html_escape_keep_slash(name))),
-                    );
-                    map
-                })
-            })
-            .collect();
+        let file_tree = build_file_tree(&state.get_sorted_filenames(), current_file);
 
         match template.render(context! {
             content => content,
@@ -1361,7 +1435,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             show_raw => true,
             mermaid_enabled => has_mermaid,
             show_navigation => true,
-            files => files,
+            file_tree => file_tree,
             current_file => current_file,
             page_title => page_title,
             standalone => state.standalone,
@@ -2315,6 +2389,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sidebar_groups_nested_files_into_a_directory_tree() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        fs::write(temp_dir.path().join("zeta.md"), "# Zeta").expect("Failed to write");
+        let docs = temp_dir.path().join("docs");
+        let api = docs.join("api");
+        fs::create_dir_all(&api).expect("Failed to create subdirs");
+        fs::write(docs.join("guide.md"), "# Guide").expect("Failed to write");
+        fs::write(api.join("v1.md"), "# V1").expect("Failed to write");
+
+        let base_dir = temp_dir
+            .path()
+            .canonicalize()
+            .expect("Failed to canonicalize base dir");
+        let tracked_files =
+            scan_markdown_files(&base_dir, true).expect("Failed to scan markdown files");
+        let router = new_router(base_dir, tracked_files, true, false, true, false, true)
+            .expect("Failed to create router");
+        let server = TestServer::new(router).expect("Failed to create test server");
+
+        let body = server.get("/docs/api/v1.md").await.text();
+
+        // Each directory becomes a collapsible group keyed by its relative path,
+        // with separators left intact rather than escaped to "&#x2f;".
+        assert!(
+            body.contains(r#"<li class="tree-dir" data-path="docs">"#),
+            "expected a group for docs"
+        );
+        assert!(
+            body.contains(r#"<li class="tree-dir" data-path="docs/api">"#),
+            "expected a nested group for docs/api"
+        );
+        // Files inside a group show only their basename, but still link to and
+        // are keyed by the full relative path.
+        assert!(
+            body.contains(r#"<li class="tree-file" data-path="docs/api/v1.md">"#),
+            "expected the nested file keyed by its full path"
+        );
+        assert!(
+            body.contains(r##"<a href="/docs/api/v1.md" class="active">v1.md</a>"##),
+            "nested file should show its basename and be marked active"
+        );
+        // Directories sort ahead of files at the same level, so "docs" precedes
+        // the top-level "zeta.md" even though the flat sort has it the other way.
+        let docs_at = body.find(r#"data-path="docs""#).expect("docs group");
+        let zeta_at = body.find(r#"data-path="zeta.md""#).expect("zeta entry");
+        assert!(docs_at < zeta_at, "directories should sort before files");
+    }
+
+    #[tokio::test]
+    async fn test_sidebar_tree_opens_only_the_active_files_ancestors() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let api = temp_dir.path().join("docs").join("api");
+        let notes = temp_dir.path().join("notes");
+        fs::create_dir_all(&api).expect("Failed to create subdirs");
+        fs::create_dir_all(&notes).expect("Failed to create subdirs");
+        fs::write(api.join("v1.md"), "# V1").expect("Failed to write");
+        fs::write(notes.join("todo.md"), "# Todo").expect("Failed to write");
+
+        let base_dir = temp_dir
+            .path()
+            .canonicalize()
+            .expect("Failed to canonicalize base dir");
+        let tracked_files =
+            scan_markdown_files(&base_dir, true).expect("Failed to scan markdown files");
+        let router = new_router(base_dir, tracked_files, true, false, true, false, true)
+            .expect("Failed to create router");
+        let server = TestServer::new(router).expect("Failed to create test server");
+
+        let body = server.get("/docs/api/v1.md").await.text();
+
+        // Directories start collapsed, except the ones holding the active file:
+        // the tree always reveals where you are without expanding the rest.
+        let open_dirs: Vec<&str> = body
+            .match_indices(r#"<li class="tree-dir" data-path=""#)
+            .filter_map(|(at, marker)| {
+                let (path, tail) = body[at + marker.len()..]
+                    .split_once("\">")
+                    .expect("unterminated data-path");
+                let tail = tail.trim_start();
+                assert!(
+                    tail.starts_with("<details"),
+                    "expected a <details> for {path}"
+                );
+                tail.starts_with("<details open>").then_some(path)
+            })
+            .collect();
+        assert_eq!(open_dirs, vec!["docs", "docs/api"]);
+    }
+
+    #[tokio::test]
     async fn test_background_scan_indexes_the_directory_after_startup() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         fs::write(temp_dir.path().join("root.md"), "# Root page").expect("Failed to write");
@@ -2710,9 +2874,12 @@ fn main() {
             !diagram_html.contains(&MERMAID_JS[..120]),
             "mermaid JS must not be inlined into the page"
         );
+        // Comfortably under the 2.7MB mermaid library, with room for the
+        // page's own inline CSS/JS to grow.
         assert!(
-            diagram_html.len() < 100_000,
-            "page should be small without inlined JS"
+            diagram_html.len() < 200_000,
+            "page should be small without inlined JS, got {}",
+            diagram_html.len()
         );
         // Shared libraries bundled once, byte-exact.
         assert_eq!(
