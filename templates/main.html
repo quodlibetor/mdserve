@@ -13,6 +13,22 @@
             document.documentElement.setAttribute('data-theme', theme);
             document.documentElement.classList.add('theme-initialized');
 
+            // Keeps a dragged width usable: never so narrow that filenames
+            // vanish, never so wide that it crowds out the page. Defined here
+            // because the width has to be restored before first paint; the
+            // resizer below uses it too.
+            window.clampSidebarWidth = function(px) {
+                return Math.min(Math.max(px, 160), Math.min(640, window.innerWidth - 120));
+            };
+
+            // Apply a dragged sidebar width before first paint, so the content
+            // column doesn't jump once the stored width is restored.
+            const storedWidth = parseInt(localStorage.getItem('sidebar-width'), 10);
+            if (storedWidth > 0) {
+                document.documentElement.style.setProperty(
+                    '--sidebar-width', clampSidebarWidth(storedWidth) + 'px');
+            }
+
             // Apply sidebar state to both html and body elements
             // This works because body inherits the collapsed state via CSS selectors
             const isSidebarCollapsed = localStorage.getItem('sidebar-collapsed') === 'true';
@@ -171,6 +187,67 @@
             min-width: var(--sidebar-collapsed-width);
             overflow: hidden;
             background: var(--bg-color);
+        }
+
+        /* Drag handle straddling the sidebar's right edge. Wider than the
+           border it sits on so it is easy to grab, but invisible until
+           hovered or focused. */
+        .sidebar-resizer {
+            position: fixed;
+            top: 0;
+            left: var(--sidebar-width);
+            width: 9px;
+            height: 100vh;
+            margin-left: -4px;
+            padding: 0;
+            border: none;
+            background: transparent;
+            cursor: col-resize;
+            z-index: 101;
+            transition: left var(--transition-speed) var(--transition-timing);
+        }
+
+        .sidebar-resizer::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 4px;
+            width: 1px;
+            height: 100%;
+            background: var(--link-color);
+            opacity: 0;
+            transition: opacity 0.15s var(--transition-timing);
+        }
+
+        .sidebar-resizer:hover::before,
+        .sidebar-resizer:focus-visible::before,
+        body.sidebar-resizing .sidebar-resizer::before {
+            opacity: 1;
+            width: 2px;
+        }
+
+        .sidebar-resizer:focus-visible {
+            outline: none;
+        }
+
+        /* A collapsed sidebar has no edge worth dragging. */
+        body.sidebar-collapsed .sidebar-resizer {
+            display: none;
+        }
+
+        /* While dragging, the sidebar must track the pointer exactly rather
+           than easing toward it, and text must not select under the cursor. */
+        body.sidebar-resizing {
+            cursor: col-resize;
+            user-select: none;
+        }
+
+        body.sidebar-resizing .sidebar,
+        body.sidebar-resizing .sidebar-resizer,
+        body.sidebar-resizing .sidebar-toggle,
+        body.sidebar-resizing #content,
+        body.sidebar-resizing #raw-content {
+            transition: none;
         }
 
         .sidebar-header {
@@ -808,6 +885,95 @@
             }
         }
 
+        // Sidebar width. The stored value is restored before first paint by the
+        // early script at the top of the document.
+        const DEFAULT_SIDEBAR_WIDTH = 250;
+        const SIDEBAR_KEYBOARD_STEP = 16;
+
+        function applySidebarWidth(px) {
+            const width = clampSidebarWidth(px);
+            document.documentElement.style.setProperty('--sidebar-width', width + 'px');
+            return width;
+        }
+
+        function setSidebarWidth(px) {
+            localStorage.setItem('sidebar-width', String(applySidebarWidth(px)));
+        }
+
+        // Read from the custom property rather than the sidebar's box, which
+        // reports the collapsed width while the sidebar is collapsed.
+        function currentSidebarWidth() {
+            const width = parseInt(
+                getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width'), 10);
+            return width > 0 ? width : DEFAULT_SIDEBAR_WIDTH;
+        }
+
+        function storedSidebarWidth() {
+            const width = parseInt(localStorage.getItem('sidebar-width'), 10);
+            return width > 0 ? width : DEFAULT_SIDEBAR_WIDTH;
+        }
+
+        // Drag the sidebar's right edge to resize it. Uses pointer capture so a
+        // fast drag that outruns the cursor keeps sending events to the handle
+        // instead of to whatever it flew over.
+        function initSidebarResizer() {
+            const resizer = document.getElementById('sidebarResizer');
+            if (!resizer) {
+                return;
+            }
+
+            resizer.addEventListener('pointerdown', function(e) {
+                // Ignore secondary buttons so a right-click doesn't start a drag.
+                if (e.button !== 0) {
+                    return;
+                }
+                e.preventDefault();
+                resizer.setPointerCapture(e.pointerId);
+                document.body.classList.add('sidebar-resizing');
+            });
+
+            resizer.addEventListener('pointermove', function(e) {
+                if (resizer.hasPointerCapture(e.pointerId)) {
+                    setSidebarWidth(e.clientX);
+                }
+            });
+
+            const endDrag = function(e) {
+                if (resizer.hasPointerCapture(e.pointerId)) {
+                    resizer.releasePointerCapture(e.pointerId);
+                }
+                document.body.classList.remove('sidebar-resizing');
+            };
+            resizer.addEventListener('pointerup', endDrag);
+            resizer.addEventListener('pointercancel', endDrag);
+
+            // Double-click the handle to go back to the default width.
+            resizer.addEventListener('dblclick', function() {
+                setSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+            });
+
+            // The handle is focusable, so give it the arrow keys too.
+            resizer.addEventListener('keydown', function(e) {
+                if (e.key === 'ArrowLeft') {
+                    setSidebarWidth(currentSidebarWidth() - SIDEBAR_KEYBOARD_STEP);
+                } else if (e.key === 'ArrowRight') {
+                    setSidebarWidth(currentSidebarWidth() + SIDEBAR_KEYBOARD_STEP);
+                } else if (e.key === 'Home') {
+                    setSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+                } else {
+                    return;
+                }
+                e.preventDefault();
+            });
+
+            // A window too narrow for the stored width shows a clamped sidebar,
+            // but the stored width is left alone so widening the window again
+            // restores it.
+            window.addEventListener('resize', function() {
+                applySidebarWidth(storedSidebarWidth());
+            });
+        }
+
         // Raw markdown source view toggle
         function updateRawToggle(showRaw) {
             const btn = document.getElementById('rawToggle');
@@ -1218,6 +1384,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             initTheme();
             initSidebar();
+            initSidebarResizer();
             initFileTree();
             initRawView();
             initMermaid();
@@ -1286,6 +1453,8 @@
         {{- file_tree_ul(file_tree, "file-list") }}
     </div>
 </nav>
+<div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-orientation="vertical"
+     aria-label="Resize sidebar" tabindex="0"></div>
 <script>
     // Runs here, parser-blocking and immediately after the sidebar markup,
     // rather than on DOMContentLoaded: a directory the user expanded must
