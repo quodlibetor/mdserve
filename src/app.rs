@@ -3475,6 +3475,7 @@ classDiagram
 
         assert!(body.contains(r#"<nav class="sidebar">"#));
         assert!(body.contains(r#"<ul class="file-list">"#));
+        assert!(body.contains(r#"id="sidebarFilter""#));
         assert!(body.contains("test1.md"));
         assert!(body.contains("test2.markdown"));
         assert!(body.contains("test3.md"));
@@ -3491,6 +3492,7 @@ classDiagram
         assert!(!body.contains(r#"<nav class="sidebar">"#));
         assert!(!body.contains("<h3>Files</h3>"));
         assert!(!body.contains(r#"<ul class="file-list">"#));
+        assert!(!body.contains(r#"id="sidebarFilter""#));
     }
 
     #[tokio::test]

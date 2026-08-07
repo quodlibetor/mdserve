@@ -265,6 +265,45 @@
             pointer-events: none;
         }
 
+        /* Filter box, pinned above the tree so it stays reachable while the
+           file list scrolls under it. */
+        .sidebar-filter {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            display: block;
+            width: 100%;
+            margin-bottom: 8px;
+            padding: 6px 10px;
+            font-family: inherit;
+            font-size: 13px;
+            color: var(--text-color);
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+        }
+
+        .sidebar-filter:focus {
+            outline: none;
+            border-color: var(--link-color);
+        }
+
+        .sidebar-filter::placeholder {
+            color: var(--blockquote-color);
+        }
+
+        /* Shown in place of the tree when nothing matches. */
+        .filter-empty {
+            display: none;
+            padding: 8px;
+            font-size: 13px;
+            color: var(--blockquote-color);
+        }
+
+        body.filter-no-matches .filter-empty {
+            display: block;
+        }
+
         /* File Navigation Tree */
         .file-list,
         .tree-children {
@@ -1222,22 +1261,27 @@
             if (!sidebar) {
                 return;
             }
-            // `toggle` doesn't bubble, so listen in the capture phase. Delegating
-            // from the sidebar keeps this working after a scan update replaces
-            // the whole tree.
-            sidebar.addEventListener('toggle', function(e) {
-                const item = e.target.closest('.tree-dir');
-                if (!item) {
+            // Persist on click rather than on the `toggle` event: filtering opens
+            // directories programmatically, and `toggle` can't tell that apart
+            // from the reader opening one. A click (which keyboard activation of
+            // a <summary> also produces) is unambiguously the reader. Delegated
+            // from the sidebar, so it survives a scan update replacing the tree.
+            sidebar.addEventListener('click', function(e) {
+                const summary = e.target.closest('.tree-dir-name');
+                if (!summary) {
                     return;
                 }
+                const item = summary.closest('.tree-dir');
+                const details = item.querySelector(':scope > details');
                 const expanded = expandedDirs();
-                if (e.target.open) {
-                    expanded.add(item.dataset.path);
-                } else {
+                // The default toggle hasn't run yet, so invert the current state.
+                if (details.open) {
                     expanded.delete(item.dataset.path);
+                } else {
+                    expanded.add(item.dataset.path);
                 }
                 localStorage.setItem(EXPANDED_DIRS_KEY, JSON.stringify([...expanded]));
-            }, true);
+            });
         }
 
         // Groups a flat, sorted list of relative paths into {dirs, files}.
@@ -1319,6 +1363,106 @@
             return list;
         }
 
+        // Filtering. Terms are matched case-insensitively against the whole
+        // relative path, and all of them must match, so "api v2" finds
+        // docs/api/v2.md without needing them adjacent.
+        function filterTerms() {
+            const input = document.getElementById('sidebarFilter');
+            return input ? input.value.toLowerCase().split(/\s+/).filter(Boolean) : [];
+        }
+
+        function pathMatches(path, terms) {
+            const haystack = path.toLowerCase();
+            return terms.every(function(term) { return haystack.includes(term); });
+        }
+
+        // Hides every row that doesn't match, keeping a directory only when it
+        // still has a visible file under it. Matching directories are forced
+        // open so their contents are actually reachable; clearing the filter
+        // puts every directory back to its stored state.
+        //
+        // Returns whether anything under `list` survived.
+        function applyFilterTo(list, terms, expanded, current) {
+            let anyVisible = false;
+
+            for (const item of list.children) {
+                let visible;
+                if (item.classList.contains('tree-dir')) {
+                    const details = item.querySelector(':scope > details');
+                    const children = details.querySelector(':scope > ul');
+                    // A directory whose own name matches keeps all its contents,
+                    // so narrowing to a folder shows what's in it.
+                    const self = pathMatches(item.dataset.path, terms);
+                    const kept = applyFilterTo(children, self ? [] : terms, expanded, current);
+                    visible = self || kept;
+                    details.open = terms.length
+                        ? visible
+                        : isDirOpen(item.dataset.path, expanded, current);
+                } else {
+                    visible = pathMatches(item.dataset.path, terms);
+                }
+                item.hidden = !visible;
+                anyVisible = anyVisible || visible;
+            }
+
+            return anyVisible;
+        }
+
+        function applyFilter() {
+            const list = document.querySelector('.sidebar .file-list');
+            if (!list) {
+                return;
+            }
+            const terms = filterTerms();
+            const anyVisible = applyFilterTo(
+                list, terms, expandedDirs(), document.body.dataset.currentFile);
+            document.body.classList.toggle('filter-no-matches', terms.length > 0 && !anyVisible);
+        }
+
+        function initSidebarFilter() {
+            const input = document.getElementById('sidebarFilter');
+            if (!input) {
+                return;
+            }
+
+            input.addEventListener('input', applyFilter);
+
+            input.addEventListener('keydown', function(e) {
+                if (e.key !== 'Escape') {
+                    return;
+                }
+                // First Escape clears a filter, a second one gives focus back to
+                // the page.
+                if (input.value) {
+                    input.value = '';
+                    applyFilter();
+                } else {
+                    input.blur();
+                }
+                e.stopPropagation();
+            });
+
+            // "/" jumps to the filter, as long as the reader isn't typing.
+            document.addEventListener('keydown', function(e) {
+                if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) {
+                    return;
+                }
+                const active = document.activeElement;
+                if (active && (active.matches('input, textarea, select') || active.isContentEditable)) {
+                    return;
+                }
+                e.preventDefault();
+                document.body.classList.remove('sidebar-collapsed');
+                localStorage.setItem('sidebar-collapsed', 'false');
+                input.focus();
+                input.select();
+            });
+
+            // A filter typed before the background scan finished still applies to
+            // whatever the scan turns up next.
+            applyFilter();
+        }
+
         // Replaces the sidebar tree with one built from `files`. The server
         // streams this list while it walks a directory in the background, so a
         // large tree fills in without disturbing the page being read. A page that
@@ -1339,6 +1483,8 @@
                 expandedDirs(),
                 'file-list'
             ));
+            // The rebuilt tree is unfiltered; reapply whatever is in the box.
+            applyFilter();
         }
 
         // Auto-refresh functionality using WebSocket.
@@ -1386,6 +1532,7 @@
             initSidebar();
             initSidebarResizer();
             initFileTree();
+            initSidebarFilter();
             initRawView();
             initMermaid();
             setupLiveReload();
@@ -1450,6 +1597,9 @@
 <nav class="sidebar">
     <div class="sidebar-header"></div>
     <div class="sidebar-content">
+        <input type="search" class="sidebar-filter" id="sidebarFilter" autocomplete="off"
+               placeholder="Filter files (/)" aria-label="Filter files">
+        <div class="filter-empty">No matching files.</div>
         {{- file_tree_ul(file_tree, "file-list") }}
     </div>
 </nav>
