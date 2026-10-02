@@ -1344,6 +1344,7 @@ fn render_empty_page(state: &MarkdownState) -> (StatusCode, Html<String>) {
         .render(context! {
             content => Value::from_safe_string(format!("<p>{message}</p>")),
             mermaid_enabled => false,
+            panzoom_enabled => false,
             show_navigation => state.show_navigation(),
             file_tree => build_file_tree(&[], ""),
             current_file => "",
@@ -1390,10 +1391,11 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
         }
     };
 
-    let (content, raw_content, has_mermaid, highlight_css_value) =
+    let (content, raw_content, has_mermaid, has_zoomable, highlight_css_value) =
         if let Some(tracked) = state.tracked_files.get(current_file) {
             let html = &tracked.html;
             let mermaid = html.contains(r#"class="language-mermaid""#);
+            let zoomable = mermaid || has_zoomable_media(html);
             // The raw-source view is highlighted markdown, so the highlight CSS
             // is needed whenever either view carries highlighted code.
             let css = if has_highlighting(html) || has_highlighting(&tracked.raw_html) {
@@ -1405,6 +1407,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
                 Value::from_safe_string(html.clone()),
                 Value::from_safe_string(tracked.raw_html.clone()),
                 mermaid,
+                zoomable,
                 css,
             )
         } else {
@@ -1417,13 +1420,15 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
         .and_then(|s| s.to_str())
         .unwrap_or(current_file);
 
-    let (mermaid_js, panzoom_js) = if state.standalone && has_mermaid {
-        (
-            Value::from_safe_string(MERMAID_JS.to_string()),
-            Value::from_safe_string(PANZOOM_JS.to_string()),
-        )
+    let mermaid_js = if state.standalone && has_mermaid {
+        Value::from_safe_string(MERMAID_JS.to_string())
     } else {
-        (Value::from(""), Value::from(""))
+        Value::from("")
+    };
+    let panzoom_js = if state.standalone && has_zoomable {
+        Value::from_safe_string(PANZOOM_JS.to_string())
+    } else {
+        Value::from("")
     };
 
     let rendered = if state.show_navigation() {
@@ -1434,6 +1439,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             raw_content => raw_content,
             show_raw => true,
             mermaid_enabled => has_mermaid,
+            panzoom_enabled => has_zoomable,
             show_navigation => true,
             file_tree => file_tree,
             current_file => current_file,
@@ -1462,6 +1468,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             raw_content => raw_content,
             show_raw => true,
             mermaid_enabled => has_mermaid,
+            panzoom_enabled => has_zoomable,
             show_navigation => false,
             page_title => page_title,
             standalone => state.standalone,
@@ -1516,6 +1523,7 @@ pub(crate) fn render_bundle_page(
     };
 
     let has_mermaid = html_body.contains(r#"class="language-mermaid""#);
+    let has_zoomable = has_mermaid || has_zoomable_media(html_body);
     let highlight_css_value = if has_highlighting(html_body) || has_highlighting(&raw_html) {
         Value::from_safe_string(highlight_css().to_string())
     } else {
@@ -1528,6 +1536,7 @@ pub(crate) fn render_bundle_page(
             raw_content => Value::from_safe_string(raw_html),
             show_raw => show_raw,
             mermaid_enabled => has_mermaid,
+            panzoom_enabled => has_zoomable,
             show_navigation => false,
             page_title => page_title,
             standalone => true,
@@ -1756,6 +1765,14 @@ async fn serve_static_file_inner(
         )
             .into_response(),
     }
+}
+
+/// Whether rendered HTML holds images or inline SVG, which get the same
+/// expand-to-pan/zoom affordance as mermaid diagrams and so need panzoom.
+/// The SVG icons in our own heading anchors don't count.
+pub(crate) fn has_zoomable_media(html: &str) -> bool {
+    html.contains("<img")
+        || html.matches("<svg").count() > html.matches(HEADING_ANCHOR_ICON).count()
 }
 
 fn is_image_file(file_path: &str) -> bool {
@@ -3432,6 +3449,32 @@ classDiagram
             !body.contains(PANZOOM_JS),
             "panzoom.min.js should not be inlined when page has no mermaid blocks"
         );
+    }
+
+    #[tokio::test]
+    async fn test_images_load_panzoom_without_mermaid() {
+        for markdown in [
+            "# Pic\n\n![diagram](diagram.svg)\n",
+            "# Inline\n\n<svg viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>\n",
+        ] {
+            let (server, _temp_file) = create_test_server(markdown).await;
+            let body = server.get("/").await.text();
+            assert!(
+                body.contains(r#"<script src="/panzoom.min.js"></script>"#),
+                "images should get the pan/zoom modal: {markdown}"
+            );
+            assert!(
+                !body.contains(r#"<script src="/mermaid.min.js"></script>"#),
+                "images alone should not load mermaid: {markdown}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plain_page_loads_no_panzoom() {
+        let (server, _temp_file) = create_test_server("# Plain\n\nJust text.\n").await;
+        let body = server.get("/").await.text();
+        assert!(!body.contains(r#"<script src="/panzoom.min.js"></script>"#));
     }
 
     #[tokio::test]

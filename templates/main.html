@@ -635,6 +635,18 @@
             z-index: 2;
         }
 
+        /* Images and inline SVG keep their inline size: a block wrapper would
+           stretch the hover area, and the button, across the whole column. */
+        .image-wrapper {
+            display: inline-block;
+            max-width: 100%;
+        }
+
+        .image-wrapper > img,
+        .image-wrapper > svg {
+            display: block;
+        }
+
         .diagram-wrapper:hover .diagram-expand-btn,
         .diagram-wrapper:focus-within .diagram-expand-btn,
         .diagram-expand-btn:focus-visible {
@@ -678,10 +690,15 @@
             cursor: grabbing;
         }
 
-        .diagram-modal-content > svg {
+        .diagram-modal-content > svg,
+        .diagram-modal-content > img {
             display: block;
             width: 100%;
             height: 100%;
+        }
+
+        .diagram-modal-content > img {
+            object-fit: contain;
         }
 
         .diagram-modal-close {
@@ -822,6 +839,8 @@
     {% else %}
     <script src="{{ mermaid_js_src }}"></script>
     {% endif %}
+    {% endif %}
+    {% if panzoom_enabled %}
     {% if panzoom_js %}
     <script>{{ panzoom_js }}</script>
     {% else %}
@@ -1127,13 +1146,9 @@
                     mermaidDiv.textContent = mermaidCode;
                     mermaidDiv.setAttribute('data-original', mermaidCode);
 
-                    // Create an expand button for pan/zoom of the mermaid diagram
-                    const btn = document.createElement('button');
-                    btn.type = 'button';
-                    btn.className = 'diagram-expand-btn';
-                    btn.setAttribute('aria-label', 'Expand diagram');
-                    btn.innerHTML = EXPAND_ICON_SVG;
-                    btn.addEventListener('click', () => openDiagramModal(mermaidDiv));
+                    // Look the svg up on click: a theme change re-renders it.
+                    const btn = createExpandButton('Expand diagram',
+                        () => mermaidDiv.querySelector('svg'));
 
                     // Create a wrapper we can put the mermaid div and expand button in
                     const wrapper = document.createElement('div');
@@ -1143,6 +1158,70 @@
 
                     // Replace the pre/code block with the wrapped mermaid div
                     preElement.parentElement.replaceChild(wrapper, preElement);
+                }
+            });
+        }
+
+        // A button that opens what `getTarget` returns in the pan/zoom modal.
+        // It may sit inside a link (a linked image), so the click must not
+        // also follow it.
+        function createExpandButton(label, getTarget) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'diagram-expand-btn';
+            btn.setAttribute('aria-label', label);
+            btn.innerHTML = EXPAND_ICON_SVG;
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openDiagramModal(getTarget());
+            });
+            return btn;
+        }
+
+        // Below this size (in either dimension) an image is a badge or an
+        // icon: there's nothing to zoom into, and the button would cover it.
+        const MIN_EXPANDABLE_PX = 64;
+
+        // A zero size means unknown (an SVG with no intrinsic size, or content
+        // that's hidden behind the raw view), which is worth expanding.
+        function isIconSized(width, height) {
+            return width > 0 && height > 0 && Math.min(width, height) < MIN_EXPANDABLE_PX;
+        }
+
+        function wrapExpandable(element) {
+            const wrapper = document.createElement('span');
+            wrapper.className = 'diagram-wrapper image-wrapper';
+            element.before(wrapper);
+            wrapper.append(element, createExpandButton('Expand image', () => element));
+        }
+
+        // Gives images and inline SVG in the page the mermaid diagrams' expand
+        // button. Must run before mermaid renders, or its output would be
+        // wrapped too; the `.mermaid` check is only a backstop.
+        function initImageExpand() {
+            const content = document.getElementById('content');
+            content.querySelectorAll('img').forEach((img) => {
+                const wrap = () => {
+                    if (!isIconSized(img.naturalWidth, img.naturalHeight)) {
+                        wrapExpandable(img);
+                    }
+                };
+                if (img.complete) {
+                    wrap();
+                } else {
+                    img.addEventListener('load', wrap, { once: true });
+                }
+            });
+            content.querySelectorAll('svg').forEach((svg) => {
+                // Nested <svg>s are part of their outermost one, and heading
+                // anchor icons are ours.
+                if (svg.parentElement.closest('svg, .mermaid, .heading-anchor')) {
+                    return;
+                }
+                const rect = svg.getBoundingClientRect();
+                if (!isIconSized(rect.width, rect.height)) {
+                    wrapExpandable(svg);
                 }
             });
         }
@@ -1181,9 +1260,9 @@
         }
 
         // Fullscreen modal with pan/zoom
-        function openDiagramModal(sourceDiagram) {
-            const svg = sourceDiagram.querySelector('svg');
-            if (!svg || typeof panzoom === 'undefined') {
+        // `source` is the <svg> or <img> to show; it's cloned, not moved.
+        function openDiagramModal(source) {
+            if (!source || typeof panzoom === 'undefined') {
                 return;
             }
 
@@ -1192,7 +1271,14 @@
             const modal = document.getElementById('diagramModal');
             const container = document.getElementById('diagramModalContent');
 
-            const clone = svg.cloneNode(true);
+            const clone = source.cloneNode(true);
+            if (clone.tagName === 'IMG') {
+                // Size attributes would fight the modal's fill-and-contain
+                // sizing, and a native image drag would steal the pan gesture.
+                clone.removeAttribute('width');
+                clone.removeAttribute('height');
+                clone.draggable = false;
+            }
             container.replaceChildren(clone);
 
             modal.classList.add('show');
@@ -1534,6 +1620,7 @@
             initFileTree();
             initSidebarFilter();
             initRawView();
+            initImageExpand();
             initMermaid();
             setupLiveReload();
 

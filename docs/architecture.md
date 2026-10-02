@@ -155,6 +155,7 @@ Conditional template rendering:
 Template variables:
 - `content`: Pre-rendered markdown HTML
 - `mermaid_enabled`: Boolean flag, conditionally includes Mermaid.js when diagrams detected
+- `panzoom_enabled`: Boolean flag, includes panzoom when the page has mermaid diagrams, images, or inline SVG; each of these gets an expand button that opens it in a pan/zoom modal (images under 64px in either dimension, like badges, are skipped client-side)
 - `show_navigation`: Controls sidebar visibility
 - `file_tree`: Tracked files grouped into a directory tree (directory mode)
 - `current_file`: Active file name (directory mode)

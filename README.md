@@ -22,7 +22,8 @@ WebSocket. This is the core interaction: an agent writes, a human reads.
 done. mdserve is not a long-running server and doesn't need to be.
 
 **Agent-friendly content.** Full GFM support (tables, task lists,
-syntax-highlighted code), Mermaid diagrams, GitHub alerts (`> [!NOTE]`), heading
+syntax-highlighted code), Mermaid diagrams and images that expand into a
+pan/zoom view, GitHub alerts (`> [!NOTE]`), heading
 anchors for in-page `#links`, YAML frontmatter rendered as a GitHub-style
 metadata table, and directory mode with a filterable sidebar file tree - the
 kinds of content AI coding agents actually produce.

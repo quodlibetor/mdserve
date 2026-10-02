@@ -520,11 +520,12 @@ fn build_entries(
     let mut entries: Vec<BundleEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut any_mermaid = false;
+    let mut any_zoomable = false;
 
     for page in &pages {
-        if page.body.contains(r#"class="language-mermaid""#) {
-            any_mermaid = true;
-        }
+        let mermaid = page.body.contains(r#"class="language-mermaid""#);
+        any_mermaid |= mermaid;
+        any_zoomable |= mermaid || crate::app::has_zoomable_media(&page.body);
         let referrer_dir = page.abs.parent().unwrap_or(base_dir).to_path_buf();
         let rewritten = rewrite_html_links(&page.body, &page.zip_path, &referrer_dir, &visited);
         let full = render(
@@ -555,6 +556,8 @@ fn build_entries(
             zip_path: BUNDLE_MERMAID_JS_PATH.to_string(),
             bytes: crate::app::MERMAID_JS.as_bytes().to_vec(),
         });
+    }
+    if any_zoomable {
         entries.push(BundleEntry {
             zip_path: BUNDLE_PANZOOM_JS_PATH.to_string(),
             bytes: crate::app::PANZOOM_JS.as_bytes().to_vec(),
