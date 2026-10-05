@@ -356,31 +356,20 @@ fn encode_href(path: &str) -> String {
     utf8_percent_encode(path, PATH_ENC).to_string()
 }
 
-/// Rewrite local `href`/`src` values in a rendered HTML body so they point at
-/// the bundled relative paths. `visited` maps canonical source path -> zip path.
-fn rewrite_html_links(
+/// Rewrite `href`/`src` values in an HTML body. `rewrite` gets each
+/// HTML-unescaped value and returns its replacement, or None to leave it as
+/// authored.
+pub(crate) fn rewrite_attr_refs(
     body: &str,
-    page_zip: &str,
-    referrer_dir: &Path,
-    visited: &HashMap<PathBuf, String>,
+    mut rewrite: impl FnMut(&str) -> Option<String>,
 ) -> String {
     let mut result = body.to_string();
     let mut applied: Vec<(String, String)> = Vec::new();
 
     for attr_ref in find_attr_refs(body) {
-        let unescaped = html_unescape(&attr_ref.value);
-        if classify_url(&unescaped) != UrlClass::Local {
-            continue;
-        }
-        let (path, suffix) = split_suffix(&unescaped);
-        let Some(target_abs) = resolve_local(referrer_dir, path) else {
+        let Some(replacement) = rewrite(&html_unescape(&attr_ref.value)) else {
             continue;
         };
-        let Some(target_zip) = visited.get(&target_abs) else {
-            continue;
-        };
-        let rel = encode_href(&rel_zip_path(page_zip, target_zip));
-        let replacement = format!("{rel}{suffix}");
 
         let old = format!(
             "{}={}{}{}",
@@ -402,6 +391,26 @@ fn rewrite_html_links(
         result = result.replace(&old, &new);
     }
     result
+}
+
+/// Rewrite local `href`/`src` values in a rendered HTML body so they point at
+/// the bundled relative paths. `visited` maps canonical source path -> zip path.
+fn rewrite_html_links(
+    body: &str,
+    page_zip: &str,
+    referrer_dir: &Path,
+    visited: &HashMap<PathBuf, String>,
+) -> String {
+    rewrite_attr_refs(body, |unescaped| {
+        if classify_url(unescaped) != UrlClass::Local {
+            return None;
+        }
+        let (path, suffix) = split_suffix(unescaped);
+        let target_abs = resolve_local(referrer_dir, path)?;
+        let target_zip = visited.get(&target_abs)?;
+        let rel = encode_href(&rel_zip_path(page_zip, target_zip));
+        Some(format!("{rel}{suffix}"))
+    })
 }
 
 // ---------------------------------------------------------------------------
