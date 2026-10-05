@@ -131,6 +131,7 @@ Single unified router handles both modes:
 - `GET /` → First file alphabetically
 - `GET /*path.md` → Specific markdown file, keyed by its path relative to the base directory (e.g. `sub/dir/notes.md`)
 - `GET /*path.<ext>` → Images from the base directory (including subdirectories)
+- `GET /_mdserve/up/<levels>/*rest` → Images a page links from above the base directory (see below)
 - `GET /ws` → WebSocket connection
 - `GET /mermaid.min.js` → Bundled Mermaid library
 - `GET /api/download` → Offline bundle zip (see below)
@@ -140,6 +141,16 @@ Tracked files are keyed by their base-directory-relative path, so the wildcard
 prevented not by rejecting `/`, but because markdown requests must match a
 tracked-file key and image requests are canonicalized and checked to remain
 within the base directory.
+
+A relative image path that climbs above the base directory
+(`../../shots/a.png` under `mdserve tasks/ux/design.md`) has no URL of its own:
+the browser clamps `..` at `/`. On loopback binds, `src/outside.rs` rewrites
+such images in each page's rendered HTML to `/_mdserve/up/<levels>/<rest>`,
+where `<levels>` counts the directories above the base where the image's path
+branches off, and records the image's canonical path on the tracked file. The
+route serves only recorded images and rejects cross-origin requests, so it
+can't read anything the served markdown doesn't already display. On network
+binds nothing is rewritten or recorded, so the route always answers 404.
 
 ### Rendering
 

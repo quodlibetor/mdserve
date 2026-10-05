@@ -183,7 +183,9 @@ Directory mode bundles the whole tracked set plus a generated `index.html`.
 For safety, collecting files from *outside* the served directory only happens on
 loopback binds; when bound to a network interface (`--hostname 0.0.0.0`) the
 bundle stays within the served directory, and the endpoint refuses cross-origin
-requests.
+requests. The same rule covers the live preview: images a page links from above
+the served directory (`![shot](../../shots/a.png)` under `mdserve docs/x.md`)
+display on loopback binds only.
 
 
 ## Themes

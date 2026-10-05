@@ -109,7 +109,7 @@ fn classify_url(raw: &str) -> UrlClass {
     }
 }
 
-fn is_windows_drive_path(s: &str) -> bool {
+pub(crate) fn is_windows_drive_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -119,7 +119,7 @@ fn is_windows_drive_path(s: &str) -> bool {
 
 /// Returns the lowercased URL scheme if `raw` begins with `scheme:` where scheme
 /// matches `[A-Za-z][A-Za-z0-9+.-]*`. Returns None for relative paths.
-fn url_scheme(raw: &str) -> Option<String> {
+pub(crate) fn url_scheme(raw: &str) -> Option<String> {
     let colon = raw.find(':')?;
     let scheme = &raw[..colon];
     if scheme.is_empty() {
@@ -139,7 +139,7 @@ fn url_scheme(raw: &str) -> Option<String> {
 
 /// Split off a trailing `?query` and/or `#fragment` (whichever comes first),
 /// returning (path, suffix). The suffix is re-appended after rewriting.
-fn split_suffix(raw: &str) -> (&str, &str) {
+pub(crate) fn split_suffix(raw: &str) -> (&str, &str) {
     let cut = match (raw.find('?'), raw.find('#')) {
         (Some(q), Some(f)) => Some(q.min(f)),
         (Some(q), None) => Some(q),
@@ -152,7 +152,7 @@ fn split_suffix(raw: &str) -> (&str, &str) {
     }
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
@@ -352,7 +352,7 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn encode_href(path: &str) -> String {
+pub(crate) fn encode_href(path: &str) -> String {
     utf8_percent_encode(path, PATH_ENC).to_string()
 }
 

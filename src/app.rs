@@ -15,12 +15,12 @@ use minijinja::{context, value::Value, Environment};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use syntect::highlighting::ThemeSet;
 use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
@@ -302,11 +302,35 @@ pub(crate) fn is_markdown_file(path: &Path) -> bool {
 
 struct TrackedFile {
     path: PathBuf,
-    last_modified: SystemTime,
     html: String,
     /// The raw markdown source rendered as a syntax-highlighted code block, for
     /// the page's "view source" toggle. Pre-rendered so serving stays in-memory.
     raw_html: String,
+    /// Canonical paths of the images this page links from above `base_dir`,
+    /// which the outside-image route may serve. See `crate::outside`.
+    outside_images: HashSet<PathBuf>,
+}
+
+impl TrackedFile {
+    /// Reads and renders `path`. When `allow_outside_base` is set, images the
+    /// page links from above `base_dir` are pointed at the outside-image route.
+    fn render(path: PathBuf, base_dir: &Path, allow_outside_base: bool) -> Result<Self> {
+        let content = fs::read_to_string(&path)?;
+        let html = markdown_to_html(&content)?;
+        let (html, outside_images) = if allow_outside_base {
+            let doc_dir = path.parent().unwrap_or(base_dir);
+            let rewritten = crate::outside::rewrite_outside_images(&html, doc_dir, base_dir);
+            (rewritten.html, rewritten.images)
+        } else {
+            (html, HashSet::new())
+        };
+        Ok(TrackedFile {
+            raw_html: render_raw_markdown(&content),
+            path,
+            html,
+            outside_images,
+        })
+    }
 }
 
 struct MarkdownState {
@@ -317,10 +341,11 @@ struct MarkdownState {
     /// Whether the initial directory scan is still running, so the UI can say
     /// "scanning" instead of looking like an empty directory.
     scanning: bool,
-    /// Whether the offline-bundle download may collect dependencies that live
-    /// outside `base_dir` (set only for loopback binds, so a networked server
-    /// can't be used to read arbitrary local files).
-    bundle_external: bool,
+    /// Whether local files outside `base_dir` may be read: by the offline-bundle
+    /// download to collect dependencies, and by the outside-image route to show
+    /// images a page links from above `base_dir`. Set only for loopback binds,
+    /// so a networked server can't be used to read arbitrary local files.
+    allow_outside_base: bool,
     change_tx: broadcast::Sender<ServerMessage>,
 }
 
@@ -331,29 +356,15 @@ impl MarkdownState {
         is_directory_mode: bool,
         standalone: bool,
         scanning: bool,
-        bundle_external: bool,
+        allow_outside_base: bool,
     ) -> Result<Self> {
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
 
         let mut tracked_files = HashMap::new();
         for file_path in file_paths {
-            let metadata = fs::metadata(&file_path)?;
-            let last_modified = metadata.modified()?;
-            let content = fs::read_to_string(&file_path)?;
-            let html = markdown_to_html(&content)?;
-            let raw_html = render_raw_markdown(&content);
-
             let key = relative_key(&base_dir, &file_path);
-
-            tracked_files.insert(
-                key,
-                TrackedFile {
-                    path: file_path,
-                    last_modified,
-                    html,
-                    raw_html,
-                },
-            );
+            let tracked = TrackedFile::render(file_path, &base_dir, allow_outside_base)?;
+            tracked_files.insert(key, tracked);
         }
 
         Ok(MarkdownState {
@@ -362,7 +373,7 @@ impl MarkdownState {
             is_directory_mode,
             standalone,
             scanning,
-            bundle_external,
+            allow_outside_base,
             change_tx,
         })
     }
@@ -388,10 +399,11 @@ impl MarkdownState {
 
     fn refresh_file(&mut self, filename: &str) -> Result<()> {
         if let Some(tracked) = self.tracked_files.get_mut(filename) {
-            let content = fs::read_to_string(&tracked.path)?;
-            tracked.html = markdown_to_html(&content)?;
-            tracked.raw_html = render_raw_markdown(&content);
-            tracked.last_modified = fs::metadata(&tracked.path)?.modified()?;
+            *tracked = TrackedFile::render(
+                tracked.path.clone(),
+                &self.base_dir,
+                self.allow_outside_base,
+            )?;
         }
         Ok(())
     }
@@ -404,18 +416,8 @@ impl MarkdownState {
             return Ok(false);
         }
 
-        let metadata = fs::metadata(&file_path)?;
-        let content = fs::read_to_string(&file_path)?;
-
-        self.tracked_files.insert(
-            key,
-            TrackedFile {
-                path: file_path,
-                last_modified: metadata.modified()?,
-                html: markdown_to_html(&content)?,
-                raw_html: render_raw_markdown(&content),
-            },
-        );
+        let tracked = TrackedFile::render(file_path, &self.base_dir, self.allow_outside_base)?;
+        self.tracked_files.insert(key, tracked);
 
         Ok(true)
     }
@@ -1074,7 +1076,7 @@ fn new_router(
     standalone: bool,
     recursive: bool,
     background_scan: bool,
-    bundle_external: bool,
+    allow_outside_base: bool,
 ) -> Result<Router> {
     let base_dir = base_dir.canonicalize()?;
 
@@ -1084,7 +1086,7 @@ fn new_router(
         is_directory_mode,
         standalone,
         background_scan,
-        bundle_external,
+        allow_outside_base,
     )?));
 
     if background_scan {
@@ -1124,6 +1126,10 @@ fn new_router(
         .route("/api/download", get(download_bundle))
         .route("/mermaid.min.js", get(serve_mermaid_js))
         .route("/panzoom.min.js", get(serve_panzoom_js))
+        .route(
+            &format!("{}/:levels/*rest", crate::outside::ROUTE_PREFIX),
+            get(serve_outside_image),
+        )
         .route("/*filename", get(serve_file))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -1194,10 +1200,10 @@ pub(crate) async fn serve_markdown(
     let hostname = hostname.as_ref();
 
     let first_file = tracked_files.first().cloned();
-    // Only allow the offline bundle to collect files outside the served
-    // directory on loopback binds; a networked server must not be usable to
-    // read arbitrary local files.
-    let bundle_external = is_loopback_host(hostname);
+    // Only read files outside the served directory (offline-bundle
+    // dependencies, images linked from above it) on loopback binds; a
+    // networked server must not be usable to read arbitrary local files.
+    let allow_outside_base = is_loopback_host(hostname);
     let router = new_router(
         base_dir.clone(),
         tracked_files,
@@ -1207,7 +1213,7 @@ pub(crate) async fn serve_markdown(
         // Directory mode always discovers its files in the background so a large
         // tree doesn't delay the first page; single-file mode has nothing to scan.
         is_directory_mode,
-        bundle_external,
+        allow_outside_base,
     )?;
 
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
@@ -1619,7 +1625,7 @@ async fn download_bundle(
             .into_response();
     }
 
-    let (base_dir, is_directory_mode, bundle_external, roots, zip_name) = {
+    let (base_dir, is_directory_mode, allow_outside_base, roots, zip_name) = {
         let state = state.lock().await;
         let roots: Vec<crate::bundle::RootDoc> = state
             .tracked_files
@@ -1632,7 +1638,7 @@ async fn download_bundle(
         (
             state.base_dir.clone(),
             state.is_directory_mode,
-            state.bundle_external,
+            state.allow_outside_base,
             roots,
             bundle_filename(&state),
         )
@@ -1643,7 +1649,7 @@ async fn download_bundle(
             &base_dir,
             &roots,
             is_directory_mode,
-            bundle_external,
+            allow_outside_base,
             render_bundle_page,
         )
     })
@@ -1767,6 +1773,49 @@ async fn serve_static_file_inner(
     }
 }
 
+/// Serves an image a tracked page links from above `base_dir`. Only images
+/// recorded while rendering a page are served, and pages record them only on
+/// loopback binds, so elsewhere this route always answers 404.
+async fn serve_outside_image(
+    AxumPath((levels, rest)): AxumPath<(usize, String)>,
+    headers: HeaderMap,
+    State(state): State<SharedMarkdownState>,
+) -> axum::response::Response {
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin requests are not allowed",
+        )
+            .into_response();
+    }
+
+    let path = {
+        let state = state.lock().await;
+        crate::outside::resolve_request(&state.base_dir, levels, &rest).filter(|path| {
+            state
+                .tracked_files
+                .values()
+                .any(|tracked| tracked.outside_images.contains(path))
+        })
+    };
+
+    let Some(path) = path else {
+        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(contents) => {
+            let content_type = guess_image_content_type(&path.to_string_lossy());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type)],
+                contents,
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+    }
+}
+
 /// Whether rendered HTML holds images or inline SVG, which get the same
 /// expand-to-pan/zoom affordance as mermaid diagrams and so need panzoom.
 /// The SVG icons in our own heading anchors don't count.
@@ -1775,7 +1824,7 @@ pub(crate) fn has_zoomable_media(html: &str) -> bool {
         || html.matches("<svg").count() > html.matches(HEADING_ANCHOR_ICON).count()
 }
 
-fn is_image_file(file_path: &str) -> bool {
+pub(crate) fn is_image_file(file_path: &str) -> bool {
     guess_image_content_type(file_path).starts_with("image/")
 }
 
@@ -2950,7 +2999,7 @@ fn main() {
 
         let base_dir = temp_dir.path().to_path_buf();
         let tracked = scan_markdown_files(&base_dir, true).expect("scan");
-        // bundle_external = false (simulating a non-loopback bind).
+        // allow_outside_base = false (simulating a non-loopback bind).
         let router =
             new_router(base_dir, tracked, true, false, true, false, false).expect("router");
         let server = TestServer::new(router).expect("test server");
@@ -3020,6 +3069,89 @@ fn main() {
             !names.contains(&"index.html".to_string()),
             "names: {names:?}"
         );
+    }
+
+    /// Serves `<root>/repo/tasks/ux/design.md` on its own (so `base_dir` is
+    /// `tasks/ux`); it links `<root>/repo/shots/plan.png` two levels up, and a
+    /// `secret.png` sits next to it unreferenced.
+    fn outside_image_server(allow_outside_base: bool) -> (TestServer, TempDir) {
+        let root = tempdir().expect("temp dir");
+        let base = root.path().join("repo/tasks/ux");
+        let shots = root.path().join("repo/shots");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&shots).unwrap();
+        fs::write(shots.join("plan.png"), tiny_png()).unwrap();
+        fs::write(shots.join("secret.png"), tiny_png()).unwrap();
+        let md = base.join("design.md");
+        fs::write(&md, "# Design\n\n![plan](../../shots/plan.png)\n").unwrap();
+
+        let router = new_router(
+            base,
+            vec![md.canonicalize().unwrap()],
+            false,
+            false,
+            false,
+            false,
+            allow_outside_base,
+        )
+        .expect("router");
+        (TestServer::new(router).expect("test server"), root)
+    }
+
+    #[tokio::test]
+    async fn test_outside_image_is_rewritten_and_served() {
+        let (server, _root) = outside_image_server(true);
+
+        let body = server.get("/design.md").await.text();
+        assert!(
+            body.contains(r#"<img src="/_mdserve/up/2/shots/plan.png" alt="plan""#),
+            "{}",
+            rendered_region(&body)
+        );
+
+        let img = server.get("/_mdserve/up/2/shots/plan.png").await;
+        assert_eq!(img.status_code(), 200);
+        assert_eq!(img.header("content-type"), "image/png");
+        assert_eq!(img.as_bytes().to_vec(), tiny_png());
+    }
+
+    #[tokio::test]
+    async fn test_outside_image_route_serves_only_linked_images() {
+        let (server, root) = outside_image_server(true);
+
+        for path in [
+            "/_mdserve/up/2/shots/secret.png",
+            "/_mdserve/up/2/shots/%2E%2E/shots/secret.png",
+            "/_mdserve/up/0/..%2F..%2Fshots%2Fsecret.png",
+        ] {
+            assert_eq!(server.get(path).await.status_code(), 404, "{path}");
+        }
+        let absolute = root.path().join("repo/shots/secret.png");
+        let absolute = format!("/_mdserve/up/0/{}", absolute.display());
+        assert_eq!(server.get(&absolute).await.status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_outside_image_rejects_cross_origin() {
+        let (server, _root) = outside_image_server(true);
+        let resp = server
+            .get("/_mdserve/up/2/shots/plan.png")
+            .add_header(
+                header::ORIGIN,
+                axum::http::HeaderValue::from_static("http://evil.example"),
+            )
+            .await;
+        assert_eq!(resp.status_code(), 403);
+    }
+
+    #[tokio::test]
+    async fn test_outside_image_not_served_when_not_loopback() {
+        let (server, _root) = outside_image_server(false);
+
+        let body = server.get("/design.md").await.text();
+        assert!(body.contains(r#"<img src="../../shots/plan.png""#));
+        let img = server.get("/_mdserve/up/2/shots/plan.png").await;
+        assert_eq!(img.status_code(), 404);
     }
 
     #[tokio::test]

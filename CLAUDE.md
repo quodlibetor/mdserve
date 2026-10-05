@@ -46,8 +46,9 @@ minijinja-embed (changes to `templates/` require a rebuild).
 - **Save/share, not deploy.** Capturing rendered output for the user to keep is
   in scope (`--standalone`, the `/api/download` offline bundle). The offline
   bundle may read local files outside the served directory to collect linked
-  dependencies, but only on loopback binds and only for same-origin requests, so
-  a networked server can't be turned into an arbitrary-file reader.
+  dependencies, and the live preview may serve images a page links from above
+  it, but only on loopback binds and only for same-origin requests, so a
+  networked server can't be turned into an arbitrary-file reader.
 
 ## Changelog
 

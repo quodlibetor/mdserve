@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod app;
 mod bundle;
+mod outside;
 
 use app::serve_markdown;
 
