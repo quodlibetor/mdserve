@@ -1574,17 +1574,39 @@
         }
 
         // Auto-refresh functionality using WebSocket.
+        // When the socket drops, wait with exponential backoff, confirm over
+        // HTTP that the server is back, and only then reopen the socket.
+        // Retries pause while the tab is hidden and resume when it is shown.
+        const RECONNECT_MIN_MS = 1000;
+        const RECONNECT_MAX_MS = 30000;
+        let reconnectDelay = RECONNECT_MIN_MS;
+        let reconnectTimer = null;
+        let reconnectPending = false;
+
         // Skip on file:// — the page was saved and there is no server to reach.
         function setupLiveReload() {
             if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
                 return;
             }
+            document.addEventListener('visibilitychange', function() {
+                if (!document.hidden && reconnectPending) {
+                    // The user is looking again: check right away.
+                    reconnectDelay = RECONNECT_MIN_MS;
+                    probeServer();
+                }
+            });
+            openSocket();
+        }
+
+        function openSocket() {
+            reconnectPending = false;
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
             const socket = new WebSocket(wsUrl);
 
             socket.onopen = function(event) {
                 console.log('WebSocket connected');
+                reconnectDelay = RECONNECT_MIN_MS;
             };
 
             socket.onmessage = function(event) {
@@ -1601,15 +1623,47 @@
                 }
             };
 
-            socket.onerror = function(event) {
-                console.error('WebSocket error:', event);
-            };
-
             socket.onclose = function(event) {
-                console.log('WebSocket closed, attempting to reconnect...');
-                // Attempt to reconnect after 3 seconds
-                setTimeout(setupLiveReload, 3000);
+                console.log('WebSocket closed, waiting for the server...');
+                scheduleReconnect();
             };
+        }
+
+        function scheduleReconnect() {
+            reconnectPending = true;
+            if (document.hidden || reconnectTimer !== null) {
+                // The visibilitychange listener picks this up when shown.
+                return;
+            }
+            // Jitter so many tabs don't hit a restarted server in lockstep.
+            const delay = reconnectDelay * (0.75 + Math.random() * 0.5);
+            reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+            reconnectTimer = setTimeout(function() {
+                reconnectTimer = null;
+                probeServer();
+            }, delay);
+        }
+
+        function probeServer() {
+            if (reconnectTimer !== null) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            if (document.hidden) {
+                return;
+            }
+            // Cleared so a visibilitychange during the fetch can't start a
+            // second probe; a failed probe sets it again.
+            reconnectPending = false;
+            fetch('/api/health', { cache: 'no-store' })
+                .then(function(response) {
+                    if (response.ok) {
+                        openSocket();
+                    } else {
+                        scheduleReconnect();
+                    }
+                })
+                .catch(scheduleReconnect);
         }
 
         // Initialize theme and live reload on page load

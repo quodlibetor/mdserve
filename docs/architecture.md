@@ -133,6 +133,9 @@ Single unified router handles both modes:
 - `GET /*path.<ext>` → Images from the base directory (including subdirectories)
 - `GET /_mdserve/up/<levels>/*rest` → Images a page links from above the base directory (see below)
 - `GET /ws` → WebSocket connection
+- `GET /api/health` → `204` liveness probe; when the socket drops, clients
+  back off (1s doubling to 30s, jittered), poll this, and reopen the socket
+  only once it answers. Retries pause while the tab is hidden.
 - `GET /mermaid.min.js` → Bundled Mermaid library
 - `GET /api/download` → Offline bundle zip (see below)
 

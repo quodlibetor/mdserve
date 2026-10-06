@@ -1122,6 +1122,7 @@ fn new_router(
     let router = Router::new()
         .route("/", get(serve_html_root))
         .route("/ws", get(websocket_handler))
+        .route("/api/health", get(health))
         .route("/api/mermaid-error", post(log_mermaid_error))
         .route("/api/download", get(download_bundle))
         .route("/mermaid.min.js", get(serve_mermaid_js))
@@ -1845,6 +1846,16 @@ fn guess_image_content_type(file_path: &str) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+/// Cheap liveness probe. The client polls this before reopening its
+/// WebSocket, so a downed server costs failed fetches rather than a stream
+/// of failed socket handshakes in the console.
+async fn health() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, "no-store")],
+    )
 }
 
 async fn websocket_handler(
@@ -3534,6 +3545,14 @@ classDiagram
             body.contains("/api/download"),
             "download button should be present even in standalone mode"
         );
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_is_uncached_no_content() {
+        let (server, _temp_file) = create_test_server("# Test").await;
+        let response = server.get("/api/health").await;
+        assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(response.header(header::CACHE_CONTROL), "no-store");
     }
 
     #[tokio::test]
